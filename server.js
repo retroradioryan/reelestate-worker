@@ -61,7 +61,7 @@ app.get("/supabase", async (req, res) => {
 });
 
 /* ----------------------------------
-   RENDER TEST (DOWNLOAD → FFMPEG → UPLOAD)
+   RENDER TEST (LIGHTWEIGHT VERSION)
 ---------------------------------- */
 
 app.post("/render-test", async (req, res) => {
@@ -76,28 +76,32 @@ app.post("/render-test", async (req, res) => {
 
     const supabase = createClient(url, key);
 
+    // Smaller sample video (more stable)
     const sampleUrl =
-  req.body?.sampleUrl ||
-  "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+      req.body?.sampleUrl ||
+      "https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4";
 
     const tmpDir = "/tmp";
     const inputPath = path.join(tmpDir, `in-${Date.now()}.mp4`);
     const outputPath = path.join(tmpDir, `out-${Date.now()}.mp4`);
 
-    // 1️⃣ Download sample video
+    /* -------- DOWNLOAD -------- */
+
     const response = await fetch(sampleUrl);
     if (!response.ok) throw new Error("Failed to download sample video");
 
     const buffer = Buffer.from(await response.arrayBuffer());
     fs.writeFileSync(inputPath, buffer);
 
-    // 2️⃣ Run FFmpeg (5-second fast encode)
+    /* -------- FFMPEG (LIGHTWEIGHT ENCODE) -------- */
+
     execSync(
-      `ffmpeg -y -i "${inputPath}" -t 5 -vf "scale=720:-2" -c:v libx264 -preset veryfast -crf 28 -an "${outputPath}"`,
+      `ffmpeg -y -i "${inputPath}" -t 3 -c:v libx264 -preset ultrafast -crf 32 -an "${outputPath}"`,
       { stdio: "ignore" }
     );
 
-    // 3️⃣ Upload to Supabase Storage
+    /* -------- UPLOAD TO SUPABASE -------- */
+
     const file = fs.readFileSync(outputPath);
     const filePath = `tests/test-${Date.now()}.mp4`;
 
@@ -120,6 +124,7 @@ app.post("/render-test", async (req, res) => {
       path: data.path,
       url: publicUrl.publicUrl,
     });
+
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
