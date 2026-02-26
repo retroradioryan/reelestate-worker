@@ -6,8 +6,13 @@ const app = express();
 app.use(express.json());
 
 // health routes
-app.get("/", (req, res) => res.json({ ok: true, service: "reelestate-worker" }));
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "reelestate-worker" });
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
 
 // verify ffmpeg is installed
 app.get("/ffmpeg", (req, res) => {
@@ -15,7 +20,11 @@ app.get("/ffmpeg", (req, res) => {
     const out = execSync("ffmpeg -version").toString();
     res.type("text").send(out);
   } catch (e) {
-    res.status(500).json({ ok: false, error: "ffmpeg not found", details: String(e) });
+    res.status(500).json({
+      ok: false,
+      error: "ffmpeg not found",
+      details: String(e),
+    });
   }
 });
 
@@ -24,18 +33,25 @@ app.get("/supabase", async (req, res) => {
   try {
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!url || !key) return res.status(400).json({ ok: false, error: "Missing env vars" });
+
+    if (!url || !key) {
+      return res.status(400).json({ ok: false, error: "Missing env vars" });
+    }
 
     const supabase = createClient(url, key);
+
     // list buckets (requires service role)
     const { data, error } = await supabase.storage.listBuckets();
     if (error) throw error;
 
-    res.json({ ok: true, buckets: data?.map(b => b.name) || [] });
+    res.json({ ok: true, buckets: data?.map((b) => b.name) || [] });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Worker running on port ${PORT}`));
+
+app.listen(PORT, () => {
+  console.log(`Worker running on port ${PORT}`);
+});
