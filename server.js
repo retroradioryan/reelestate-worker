@@ -1,11 +1,17 @@
 import express from "express";
 import { execSync } from "child_process";
 import { createClient } from "@supabase/supabase-js";
+import fs from "fs";
+import path from "path";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-// health routes
+/* ----------------------------------
+   BASIC HEALTH ROUTES
+---------------------------------- */
+
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "reelestate-worker" });
 });
@@ -14,7 +20,10 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-// verify ffmpeg is installed
+/* ----------------------------------
+   CHECK FFMPEG
+---------------------------------- */
+
 app.get("/ffmpeg", (req, res) => {
   try {
     const out = execSync("ffmpeg -version").toString();
@@ -28,7 +37,10 @@ app.get("/ffmpeg", (req, res) => {
   }
 });
 
-// optional: quick supabase sanity check (doesn't upload anything)
+/* ----------------------------------
+   CHECK SUPABASE CONNECTION
+---------------------------------- */
+
 app.get("/supabase", async (req, res) => {
   try {
     const url = process.env.SUPABASE_URL;
@@ -39,8 +51,6 @@ app.get("/supabase", async (req, res) => {
     }
 
     const supabase = createClient(url, key);
-
-    // list buckets (requires service role)
     const { data, error } = await supabase.storage.listBuckets();
     if (error) throw error;
 
@@ -49,6 +59,75 @@ app.get("/supabase", async (req, res) => {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
+
+/* ----------------------------------
+   RENDER TEST (DOWNLOAD → FFMPEG → UPLOAD)
+---------------------------------- */
+
+app.post("/render-test", async (req, res) => {
+  try {
+    const bucket = process.env.STORAGE_BUCKET || "videos";
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!url || !key) {
+      return res.status(400).json({ ok: false, error: "Missing env vars" });
+    }
+
+    const supabase = createClient(url, key);
+
+    const sampleUrl =
+      req.body?.sampleUrl ||
+      "https://filesamples.com/samples/video/mp4/sample_640x360.mp4";
+
+    const tmpDir = "/tmp";
+    const inputPath = path.join(tmpDir, `in-${Date.now()}.mp4`);
+    const outputPath = path.join(tmpDir, `out-${Date.now()}.mp4`);
+
+    // 1️⃣ Download sample video
+    const response = await fetch(sampleUrl);
+    if (!response.ok) throw new Error("Failed to download sample video");
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    fs.writeFileSync(inputPath, buffer);
+
+    // 2️⃣ Run FFmpeg (5-second fast encode)
+    execSync(
+      `ffmpeg -y -i "${inputPath}" -t 5 -vf "scale=720:-2" -c:v libx264 -preset veryfast -crf 28 -an "${outputPath}"`,
+      { stdio: "ignore" }
+    );
+
+    // 3️⃣ Upload to Supabase Storage
+    const file = fs.readFileSync(outputPath);
+    const filePath = `tests/test-${Date.now()}.mp4`;
+
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .upload(filePath, file, {
+        contentType: "video/mp4",
+        upsert: true,
+      });
+
+    if (error) throw error;
+
+    const { data: publicUrl } = supabase.storage
+      .from(bucket)
+      .getPublicUrl(data.path);
+
+    res.json({
+      ok: true,
+      bucket,
+      path: data.path,
+      url: publicUrl.publicUrl,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+/* ----------------------------------
+   START SERVER
+---------------------------------- */
 
 const PORT = process.env.PORT || 10000;
 
