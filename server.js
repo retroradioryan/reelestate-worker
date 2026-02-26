@@ -77,8 +77,8 @@ app.post("/render-test", async (req, res) => {
     const supabase = createClient(url, key);
 
     const sampleUrl =
-      req.body?.sampleUrl ||
-      "https://filesamples.com/samples/video/mp4/sample_640x360.mp4";
+  req.body?.sampleUrl ||
+  "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
 
     const tmpDir = "/tmp";
     const inputPath = path.join(tmpDir, `in-${Date.now()}.mp4`);
