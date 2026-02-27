@@ -17,9 +17,11 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 function getSupabase() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
   if (!url || !key) {
     throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   }
+
   return createClient(url, key);
 }
 
@@ -57,17 +59,17 @@ app.get("/", (req, res) => {
 });
 
 /* ----------------------------------
-   COMPOSE WALKTHROUGH (PRODUCTION)
+   FAST COMPOSE WALKTHROUGH
 ---------------------------------- */
 
 app.post("/compose-walkthrough", async (req, res) => {
   try {
-    const { walkthroughUrl, avatarUrl, logoUrl, maxSeconds = 30 } = req.body;
+    const { walkthroughUrl, avatarUrl, maxSeconds = 30 } = req.body;
 
-    if (!walkthroughUrl || !avatarUrl || !logoUrl) {
+    if (!walkthroughUrl || !avatarUrl) {
       return res.status(400).json({
         ok: false,
-        error: "walkthroughUrl, avatarUrl and logoUrl required"
+        error: "walkthroughUrl and avatarUrl required"
       });
     }
 
@@ -79,32 +81,27 @@ app.post("/compose-walkthrough", async (req, res) => {
 
     const walkPath = path.join(tmp, `walk-${id}.mp4`);
     const avatarPath = path.join(tmp, `avatar-${id}.mp4`);
-    const logoPath = path.join(tmp, `logo-${id}.png`);
-
-    const mainPath = path.join(tmp, `main-${id}.mp4`);
-    const introPath = path.join(tmp, `intro-${id}.mp4`);
-    const outroPath = path.join(tmp, `outro-${id}.mp4`);
-    const finalPath = path.join(tmp, `final-${id}.mp4`);
+    const outputPath = path.join(tmp, `final-${id}.mp4`);
 
     /* ----------------------------------
-       DOWNLOAD ASSETS
+       DOWNLOAD
     ---------------------------------- */
 
     await downloadToFile(walkthroughUrl, walkPath);
     await downloadToFile(avatarUrl, avatarPath);
-    await downloadToFile(logoUrl, logoPath);
 
     /* ----------------------------------
-       CREATE MAIN VIDEO
+       FAST FILTER STACK
+       - Vertical
+       - Larger avatar
+       - Clean chroma
+       - Avatar audio only
     ---------------------------------- */
 
     const filter =
-      "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[vbg];" +
-      "[1:v]scale=iw*0.42:-2,chromakey=0x00FF00:0.22:0.06,format=rgba[fg];" +
-      "[fg]split[fg1][fg2];" +
-      "[fg1]colorchannelmixer=aa=0.5,boxblur=8:4[shadow];" +
-      "[vbg][shadow]overlay=W-w-86:H-h-150[bgshadow];" +
-      "[bgshadow][fg2]overlay=W-w-80:H-h-140[outv]";
+      "[0:v]transpose=1,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[bg];" +
+      "[1:v]scale=iw*0.45:-2,chromakey=0x00FF00:0.20:0.08[fg];" +
+      "[bg][fg]overlay=W-w-60:H-h-120[outv]";
 
     await runFFmpeg([
       "-y",
@@ -115,77 +112,19 @@ app.post("/compose-walkthrough", async (req, res) => {
       "-map", "[outv]",
       "-map", "1:a?",
       "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
+      "-preset", "ultrafast",   // 🔥 fastest possible
+      "-crf", "28",             // slightly lower quality for speed
       "-pix_fmt", "yuv420p",
       "-c:a", "aac",
       "-b:a", "128k",
-      mainPath
-    ]);
-
-    /* ----------------------------------
-       CREATE INTRO (1.5 sec fade)
-    ---------------------------------- */
-
-    await runFFmpeg([
-      "-y",
-      "-loop", "1",
-      "-i", logoPath,
-      "-t", "1.5",
-      "-vf",
-      "scale=800:-1,format=rgba,fade=t=in:st=0:d=0.4,fade=t=out:st=1.1:d=0.4," +
-      "pad=1080:1920:(1080-iw)/2:(1920-ih)/2:color=black",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
-      introPath
-    ]);
-
-    /* ----------------------------------
-       CREATE OUTRO
-    ---------------------------------- */
-
-    await runFFmpeg([
-      "-y",
-      "-loop", "1",
-      "-i", logoPath,
-      "-t", "1.5",
-      "-vf",
-      "scale=800:-1,format=rgba,fade=t=in:st=0:d=0.4,fade=t=out:st=1.1:d=0.4," +
-      "pad=1080:1920:(1080-iw)/2:(1920-ih)/2:color=black",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
-      outroPath
-    ]);
-
-    /* ----------------------------------
-       CONCAT ALL
-    ---------------------------------- */
-
-    const listPath = path.join(tmp, `list-${id}.txt`);
-    fs.writeFileSync(listPath,
-      `file '${introPath}'\nfile '${mainPath}'\nfile '${outroPath}'`
-    );
-
-    await runFFmpeg([
-      "-y",
-      "-f", "concat",
-      "-safe", "0",
-      "-i", listPath,
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
-      "-c:a", "aac",
-      "-b:a", "128k",
-      finalPath
+      outputPath
     ]);
 
     /* ----------------------------------
        UPLOAD
     ---------------------------------- */
 
-    const buffer = fs.readFileSync(finalPath);
+    const buffer = fs.readFileSync(outputPath);
     const storagePath = `renders/walkthrough-${id}.mp4`;
 
     const { data, error } = await supabase.storage
@@ -211,7 +150,12 @@ app.post("/compose-walkthrough", async (req, res) => {
   }
 });
 
+/* ----------------------------------
+   START SERVER
+---------------------------------- */
+
 const PORT = process.env.PORT || 10000;
+
 app.listen(PORT, () => {
   console.log(`Worker running on port ${PORT}`);
 });
