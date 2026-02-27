@@ -8,7 +8,7 @@ import fetch from "node-fetch";
 const app = express();
 
 /* ----------------------------------
-   BODY LIMITS (important for signed URLs)
+   BODY LIMITS
 ---------------------------------- */
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
@@ -32,10 +32,7 @@ async function downloadToFile(fileUrl, outPath) {
   console.log("Downloading:", fileUrl);
 
   const response = await fetch(fileUrl);
-
-  if (!response.ok) {
-    throw new Error(`Download failed: ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`Download failed: ${response.status}`);
 
   await new Promise((resolve, reject) => {
     const fileStream = fs.createWriteStream(outPath);
@@ -44,12 +41,8 @@ async function downloadToFile(fileUrl, outPath) {
     fileStream.on("finish", resolve);
   });
 
-  console.log("Downloaded to:", outPath);
+  console.log("Downloaded:", outPath);
 }
-
-/* ----------------------------------
-   SAFE FFMPEG RUNNER (async)
----------------------------------- */
 
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
@@ -62,18 +55,14 @@ function runFFmpeg(args) {
     });
 
     ff.on("close", (code) => {
-      if (code === 0) {
-        console.log("FFmpeg complete");
-        resolve();
-      } else {
-        reject(new Error(`FFmpeg exited with code ${code}`));
-      }
+      if (code === 0) resolve();
+      else reject(new Error(`FFmpeg exited with code ${code}`));
     });
   });
 }
 
 /* ----------------------------------
-   HEALTH CHECK
+   HEALTH
 ---------------------------------- */
 
 app.get("/", (req, res) => {
@@ -81,7 +70,7 @@ app.get("/", (req, res) => {
 });
 
 /* ----------------------------------
-   COMPOSE WALKTHROUGH
+   COMPOSE WALKTHROUGH (CORPORATE PRO)
 ---------------------------------- */
 
 app.post("/compose-walkthrough", async (req, res) => {
@@ -115,44 +104,55 @@ app.post("/compose-walkthrough", async (req, res) => {
     await downloadToFile(avatarUrl, avatarPath);
 
     /* ----------------------------------
-       2️⃣ COMPOSE VIDEO
-       - Vertical 1080x1920
-       - Avatar PiP bottom-right
-       - REMOVE walkthrough audio
-       - USE avatar audio
+       2️⃣ CORPORATE PREMIUM FILTER STACK
     ---------------------------------- */
+
+    const filterComplex =
+      "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,format=yuv420p[vbg];" +
+
+      // Subtle vignette
+      "[vbg]vignette=PI/5[vbg2];" +
+
+      // Avatar scaling + clean chroma
+      "[1:v]scale=iw*0.38:-2,chromakey=0x00FF00:0.16:0.08,format=rgba[fg];" +
+
+      // Drop shadow layer
+      "[fg]split[fg1][fg2];" +
+      "[fg1]colorchannelmixer=aa=0.35,boxblur=12:4[shadow];" +
+
+      // Place shadow
+      "[vbg2][shadow]overlay=W-w-88:H-h-148[bgshadow];" +
+
+      // Place avatar
+      "[bgshadow][fg2]overlay=W-w-80:H-h-140[withavatar];" +
+
+      // Subtle frame border
+      "[withavatar]drawbox=x=0:y=0:w=iw:h=ih:color=white@0.05:t=20[framed];" +
+
+      // Clean lower third panel
+      "[framed]drawbox=x=0:y=ih-260:w=iw:h=200:color=black@0.45:t=fill[outv]";
 
     const ffmpegArgs = [
       "-y",
       "-t", String(maxSeconds),
-
-      // Inputs
       "-i", walkthroughPath,
       "-i", avatarPath,
-
-      // Filters
-      "-filter_complex",
-      "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[bg];" +
-      "[1:v]scale=iw*0.30:-2,chromakey=0x00FF00:0.18:0.10,format=rgba[fg];" +
-      "[bg][fg]overlay=W-w-40:H-h-60",
-
-      // 🔥 THIS IS THE IMPORTANT PART
-      // Use avatar audio (input 1)
-      "-map", "1:a?",
-
-      // Video encoding
+      "-filter_complex", filterComplex,
+      "-map", "[outv]",
+      "-map", "1:a?", // Use avatar audio only
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
-
+      "-c:a", "aac",
+      "-b:a", "128k",
       outputPath
     ];
 
     await runFFmpeg(ffmpegArgs);
 
     /* ----------------------------------
-       3️⃣ UPLOAD FINAL VIDEO
+       3️⃣ UPLOAD FINAL
     ---------------------------------- */
 
     const fileBuffer = fs.readFileSync(outputPath);
