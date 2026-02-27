@@ -8,7 +8,7 @@ import fetch from "node-fetch";
 const app = express();
 
 /* ----------------------------------
-   IMPORTANT: Increase body limit
+   BODY LIMITS (important for signed URLs)
 ---------------------------------- */
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
@@ -20,40 +20,41 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 function getSupabase() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
   if (!url || !key) {
     throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   }
+
   return createClient(url, key);
 }
 
 async function downloadToFile(fileUrl, outPath) {
   console.log("Downloading:", fileUrl);
 
-  const r = await fetch(fileUrl);
-  if (!r.ok) throw new Error(`Download failed ${r.status}`);
+  const response = await fetch(fileUrl);
+
+  if (!response.ok) {
+    throw new Error(`Download failed: ${response.status}`);
+  }
 
   await new Promise((resolve, reject) => {
-    const ws = fs.createWriteStream(outPath);
-    r.body.pipe(ws);
-    r.body.on("error", reject);
-    ws.on("finish", resolve);
+    const fileStream = fs.createWriteStream(outPath);
+    response.body.pipe(fileStream);
+    response.body.on("error", reject);
+    fileStream.on("finish", resolve);
   });
+
+  console.log("Downloaded to:", outPath);
 }
 
 /* ----------------------------------
-   HEALTH
----------------------------------- */
-
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "reelestate-worker" });
-});
-
-/* ----------------------------------
-   SAFE FFMPEG RUNNER
+   SAFE FFMPEG RUNNER (async)
 ---------------------------------- */
 
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
+    console.log("Running FFmpeg...");
+
     const ff = spawn("ffmpeg", args);
 
     ff.stderr.on("data", (data) => {
@@ -61,14 +62,26 @@ function runFFmpeg(args) {
     });
 
     ff.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`FFmpeg exited with code ${code}`));
+      if (code === 0) {
+        console.log("FFmpeg complete");
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg exited with code ${code}`));
+      }
     });
   });
 }
 
 /* ----------------------------------
-   COMPOSE WALKTHROUGH (SAFE)
+   HEALTH CHECK
+---------------------------------- */
+
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "reelestate-worker" });
+});
+
+/* ----------------------------------
+   COMPOSE WALKTHROUGH
 ---------------------------------- */
 
 app.post("/compose-walkthrough", async (req, res) => {
@@ -80,12 +93,12 @@ app.post("/compose-walkthrough", async (req, res) => {
     if (!walkthroughUrl || !avatarUrl) {
       return res.status(400).json({
         ok: false,
-        error: "Missing walkthroughUrl or avatarUrl",
+        error: "Missing walkthroughUrl or avatarUrl"
       });
     }
 
-    const bucket = process.env.STORAGE_BUCKET || "videos";
     const supabase = getSupabase();
+    const bucket = process.env.STORAGE_BUCKET || "videos";
 
     const tmpDir = "/tmp";
     const id = Date.now();
@@ -94,35 +107,54 @@ app.post("/compose-walkthrough", async (req, res) => {
     const avatarPath = path.join(tmpDir, `avatar-${id}.mp4`);
     const outputPath = path.join(tmpDir, `final-${id}.mp4`);
 
-    // 1️⃣ Download files
+    /* ----------------------------------
+       1️⃣ DOWNLOAD INPUTS
+    ---------------------------------- */
+
     await downloadToFile(walkthroughUrl, walkthroughPath);
     await downloadToFile(avatarUrl, avatarPath);
 
-    console.log("Downloads complete");
+    /* ----------------------------------
+       2️⃣ COMPOSE VIDEO
+       - Vertical 1080x1920
+       - Avatar PiP bottom-right
+       - REMOVE walkthrough audio
+       - USE avatar audio
+    ---------------------------------- */
 
-    // 2️⃣ Run FFmpeg (lighter settings for Render stability)
-    const args = [
+    const ffmpegArgs = [
       "-y",
       "-t", String(maxSeconds),
+
+      // Inputs
       "-i", walkthroughPath,
       "-i", avatarPath,
+
+      // Filters
       "-filter_complex",
       "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[bg];" +
       "[1:v]scale=iw*0.30:-2,chromakey=0x00FF00:0.18:0.10,format=rgba[fg];" +
       "[bg][fg]overlay=W-w-40:H-h-60",
-      "-map", "0:a?",
+
+      // 🔥 THIS IS THE IMPORTANT PART
+      // Use avatar audio (input 1)
+      "-map", "1:a?",
+
+      // Video encoding
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
+
       outputPath
     ];
 
-    await runFFmpeg(args);
+    await runFFmpeg(ffmpegArgs);
 
-    console.log("FFmpeg complete");
+    /* ----------------------------------
+       3️⃣ UPLOAD FINAL VIDEO
+    ---------------------------------- */
 
-    // 3️⃣ Upload to Supabase
     const fileBuffer = fs.readFileSync(outputPath);
     const storagePath = `renders/walkthrough-${id}.mp4`;
 
@@ -130,7 +162,7 @@ app.post("/compose-walkthrough", async (req, res) => {
       .from(bucket)
       .upload(storagePath, fileBuffer, {
         contentType: "video/mp4",
-        upsert: true,
+        upsert: true
       });
 
     if (error) throw error;
@@ -138,18 +170,19 @@ app.post("/compose-walkthrough", async (req, res) => {
     const { data: publicUrl } =
       supabase.storage.from(bucket).getPublicUrl(data.path);
 
-    console.log("Upload complete");
+    console.log("Upload complete:", publicUrl.publicUrl);
 
     res.json({
       ok: true,
-      url: publicUrl.publicUrl,
+      url: publicUrl.publicUrl
     });
 
-  } catch (e) {
-    console.error("COMPOSE ERROR:", e);
+  } catch (error) {
+    console.error("COMPOSE ERROR:", error);
+
     res.status(500).json({
       ok: false,
-      error: String(e),
+      error: String(error)
     });
   }
 });
