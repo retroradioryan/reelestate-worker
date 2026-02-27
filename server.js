@@ -70,7 +70,7 @@ app.get("/", (req, res) => {
 });
 
 /* ----------------------------------
-   COMPOSE WALKTHROUGH (CORPORATE PRO)
+   COMPOSE WALKTHROUGH (CLEAN VERSION)
 ---------------------------------- */
 
 app.post("/compose-walkthrough", async (req, res) => {
@@ -96,41 +96,17 @@ app.post("/compose-walkthrough", async (req, res) => {
     const avatarPath = path.join(tmpDir, `avatar-${id}.mp4`);
     const outputPath = path.join(tmpDir, `final-${id}.mp4`);
 
-    /* ----------------------------------
-       1️⃣ DOWNLOAD INPUTS
-    ---------------------------------- */
+    /* 1️⃣ DOWNLOAD INPUTS */
 
     await downloadToFile(walkthroughUrl, walkthroughPath);
     await downloadToFile(avatarUrl, avatarPath);
 
-    /* ----------------------------------
-       2️⃣ CORPORATE PREMIUM FILTER STACK
-    ---------------------------------- */
+    /* 2️⃣ CLEAN COMPOSITING */
 
     const filterComplex =
-      "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,format=yuv420p[vbg];" +
-
-      // Subtle vignette
-      "[vbg]vignette=PI/5[vbg2];" +
-
-      // Avatar scaling + clean chroma
-      "[1:v]scale=iw*0.38:-2,chromakey=0x00FF00:0.16:0.08,format=rgba[fg];" +
-
-      // Drop shadow layer
-      "[fg]split[fg1][fg2];" +
-      "[fg1]colorchannelmixer=aa=0.35,boxblur=12:4[shadow];" +
-
-      // Place shadow
-      "[vbg2][shadow]overlay=W-w-88:H-h-148[bgshadow];" +
-
-      // Place avatar
-      "[bgshadow][fg2]overlay=W-w-80:H-h-140[withavatar];" +
-
-      // Subtle frame border
-      "[withavatar]drawbox=x=0:y=0:w=iw:h=ih:color=white@0.05:t=20[framed];" +
-
-      // Clean lower third panel
-      "[framed]drawbox=x=0:y=ih-260:w=iw:h=200:color=black@0.45:t=fill[outv]";
+      "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[bg];" +
+      "[1:v]scale=iw*0.40:-2,chromakey=0x00FF00:0.30:0.12,format=rgba[fg];" +
+      "[bg][fg]overlay=W-w-80:H-h-140[outv]";
 
     const ffmpegArgs = [
       "-y",
@@ -139,7 +115,7 @@ app.post("/compose-walkthrough", async (req, res) => {
       "-i", avatarPath,
       "-filter_complex", filterComplex,
       "-map", "[outv]",
-      "-map", "1:a?", // Use avatar audio only
+      "-map", "1:a?",   // Use avatar audio only
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "23",
@@ -151,9 +127,7 @@ app.post("/compose-walkthrough", async (req, res) => {
 
     await runFFmpeg(ffmpegArgs);
 
-    /* ----------------------------------
-       3️⃣ UPLOAD FINAL
-    ---------------------------------- */
+    /* 3️⃣ UPLOAD FINAL */
 
     const fileBuffer = fs.readFileSync(outputPath);
     const storagePath = `renders/walkthrough-${id}.mp4`;
