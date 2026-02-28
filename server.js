@@ -14,32 +14,31 @@ function mustEnv(name) {
   return v;
 }
 
-function getSupabase() {
-  return createClient(
-    mustEnv("SUPABASE_URL"),
-    mustEnv("SUPABASE_SERVICE_ROLE_KEY")
-  );
-}
+const supabase = createClient(
+  mustEnv("SUPABASE_URL"),
+  mustEnv("SUPABASE_SERVICE_ROLE_KEY")
+);
 
 /* ==============================
-   ROUTES
+   HEALTH
 ============================== */
 
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "reelestate-api" });
 });
 
-/* START JOB (LIGHTWEIGHT ONLY) */
+/* ==============================
+   START JOB
+============================== */
 
 app.post("/compose-walkthrough", async (req, res) => {
   try {
-    const supabase = getSupabase();
     const { walkthroughUrl, logoUrl, maxSeconds = 30 } = req.body;
 
     if (!walkthroughUrl || !logoUrl) {
       return res.status(400).json({
         ok: false,
-        error: "walkthroughUrl and logoUrl required"
+        error: "walkthroughUrl and logoUrl required",
       });
     }
 
@@ -49,7 +48,7 @@ app.post("/compose-walkthrough", async (req, res) => {
         status: "queued",
         walkthrough_url: walkthroughUrl,
         logo_url: logoUrl,
-        max_seconds: maxSeconds
+        max_seconds: maxSeconds,
       })
       .select("*")
       .single();
@@ -58,24 +57,24 @@ app.post("/compose-walkthrough", async (req, res) => {
 
     res.json({
       ok: true,
-      job_id: job.id
+      job_id: job.id,
     });
 
   } catch (err) {
     console.error("START ERROR:", err);
     res.status(500).json({
       ok: false,
-      error: String(err)
+      error: String(err),
     });
   }
 });
 
-/* JOB STATUS */
+/* ==============================
+   JOB STATUS
+============================== */
 
 app.get("/job/:id", async (req, res) => {
   try {
-    const supabase = getSupabase();
-
     const { data, error } = await supabase
       .from("render_jobs")
       .select("*")
@@ -85,13 +84,13 @@ app.get("/job/:id", async (req, res) => {
     if (error || !data) {
       return res.status(404).json({
         ok: false,
-        error: "Job not found"
+        error: "Job not found",
       });
     }
 
     res.json({
       ok: true,
-      job: data
+      job: data,
     });
 
   } catch (err) {
@@ -100,27 +99,33 @@ app.get("/job/:id", async (req, res) => {
   }
 });
 
-/* HEYGEN CALLBACK (NO FFMPEG HERE) */
+/* ==============================
+   HEYGEN WEBHOOK (FINAL CORRECT VERSION)
+============================== */
 
 app.post("/heygen-callback", async (req, res) => {
   try {
-    const token = req.query.token;
-    const jobId = Number(req.query.job_id);
+    console.log("WEBHOOK RECEIVED:", req.body);
 
-    if (token !== process.env.HEYGEN_WEBHOOK_SECRET) {
-      return res.status(401).json({ ok: false });
-    }
-
+    const videoId = req.body?.data?.video_id;
     const status = req.body?.data?.status;
     const videoUrl = req.body?.data?.video_url;
 
-    const supabase = getSupabase();
+    if (!videoId) {
+      return res.json({ ok: true }); // Ignore malformed events
+    }
 
     if (status === "completed" && videoUrl) {
-      await supabase.from("render_jobs").update({
-        status: "rendering",
-        heygen_video_url: videoUrl
-      }).eq("id", jobId);
+
+      await supabase
+        .from("render_jobs")
+        .update({
+          status: "rendering",
+          heygen_video_url: videoUrl,
+        })
+        .eq("heygen_video_id", videoId);
+
+      console.log("Updated job to rendering:", videoId);
     }
 
     res.json({ ok: true });
