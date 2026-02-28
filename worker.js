@@ -22,16 +22,15 @@ function getSupabase() {
 }
 
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ==============================
-   HELPERS
+   FILE DOWNLOAD
 ============================== */
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function downloadToFile(url, outPath) {
   if (!url || !url.startsWith("http")) {
-    throw new Error(`Invalid download URL: ${url}`);
+    throw new Error(`Invalid URL: ${url}`);
   }
 
   const resp = await fetch(url);
@@ -49,6 +48,10 @@ async function downloadToFile(url, outPath) {
   });
 }
 
+/* ==============================
+   FFMPEG WRAPPER
+============================== */
+
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", args);
@@ -58,7 +61,7 @@ function runFFmpeg(args) {
 
     ff.on("close", code => {
       if (code === 0) resolve();
-      else reject(new Error(`FFmpeg exited ${code}`));
+      else reject(new Error(`FFmpeg exited with code ${code}`));
     });
   });
 }
@@ -68,8 +71,6 @@ function runFFmpeg(args) {
 ============================== */
 
 async function heygenCreateVideo(audioUrl) {
-  const avatarId = mustEnv("HEYGEN_AVATAR_ID");
-
   const resp = await fetch(
     "https://api.heygen.com/v2/video/generate",
     {
@@ -82,7 +83,7 @@ async function heygenCreateVideo(audioUrl) {
         video_inputs: [{
           character: {
             type: "avatar",
-            avatar_id: avatarId
+            avatar_id: mustEnv("HEYGEN_AVATAR_ID")
           },
           voice: {
             type: "audio",
@@ -108,22 +109,24 @@ async function heygenCreateVideo(audioUrl) {
 }
 
 /* ==============================
-   HEYGEN STATUS (FIXED)
+   HEYGEN STATUS (CORRECT)
 ============================== */
 
 async function checkHeygenStatus(videoId) {
   const resp = await fetch(
-    `https://api.heygen.com/v2/video/${videoId}`,
+    `https://api.heygen.com/v2/video/status?video_id=${videoId}`,
     {
+      method: "GET",
       headers: {
-        "X-Api-Key": mustEnv("HEYGEN_API_KEY")
+        "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
+        "Accept": "application/json"
       }
     }
   );
 
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`HeyGen status error: ${text}`);
+    throw new Error(`HeyGen status error: ${resp.status} ${text}`);
   }
 
   const json = await resp.json();
@@ -185,12 +188,12 @@ async function processHeygen(job) {
 
   console.log("Checking HeyGen:", job.id);
 
-  const status = await checkHeygenStatus(job.heygen_video_id);
+  const data = await checkHeygenStatus(job.heygen_video_id);
 
-  if (status?.status === "completed") {
+  if (data?.status === "completed") {
     await supabase.from("render_jobs").update({
       status: "rendering",
-      heygen_video_url: status.video_url
+      heygen_video_url: data.video_url
     }).eq("id", job.id);
   }
 }
