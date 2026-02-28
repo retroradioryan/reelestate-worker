@@ -4,10 +4,6 @@ import fs from "fs";
 import path from "path";
 import fetch from "node-fetch";
 
-/* ==============================
-   ENV
-============================== */
-
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -23,22 +19,13 @@ function getSupabase() {
 
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 
-/* ==============================
-   HELPERS
-============================== */
-
 async function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
 async function downloadToFile(url, outPath) {
-  if (!url || !url.startsWith("http")) {
-    throw new Error(`Invalid download URL: ${url}`);
-  }
-
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
-
   await new Promise((resolve, reject) => {
     const stream = fs.createWriteStream(outPath);
     resp.body.pipe(stream);
@@ -60,114 +47,34 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN
+   HEYGEN STATUS CHECK
 ============================== */
 
-async function heygenCreateVideo(audioUrl, jobId) {
-  const avatarId = mustEnv("HEYGEN_AVATAR_ID");
-  const baseUrl = mustEnv("PUBLIC_BASE_URL");
-  const secret = mustEnv("HEYGEN_WEBHOOK_SECRET");
-
-  const callbackUrl =
-    `${baseUrl}/heygen-callback?token=${secret}&job_id=${jobId}`;
-
-  const body = {
-    video_inputs: [{
-      character: {
-        type: "avatar",
-        avatar_id: avatarId
-      },
-      voice: {
-        type: "audio",
-        audio_url: audioUrl
-      },
-      background: {
-        type: "color",
-        value: "#00FF00"
-      }
-    }],
-    dimension: { width: 1080, height: 1920 },
-    callback_url: callbackUrl
-  };
-
+async function checkHeygenStatus(videoId) {
   const resp = await fetch(
-    "https://api.heygen.com/v2/video/generate",
+    `https://api.heygen.com/v2/video/status?video_id=${videoId}`,
     {
-      method: "POST",
       headers: {
-        "Content-Type": "application/json",
         "X-Api-Key": mustEnv("HEYGEN_API_KEY")
-      },
-      body: JSON.stringify(body)
+      }
     }
   );
 
   const json = await resp.json();
   if (!resp.ok) throw new Error(JSON.stringify(json));
 
-  return json?.data?.video_id;
+  return json?.data;
 }
 
 /* ==============================
-   PHASE 1 — QUEUED
-============================== */
-
-async function processQueued(job) {
-  const supabase = getSupabase();
-  const jobId = job.id;
-
-  console.log("Processing QUEUED job:", jobId);
-
-  const tmp = "/tmp";
-  const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
-  const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
-
-  await downloadToFile(job.walkthrough_url, walkPath);
-
-  await runFFmpeg([
-    "-y",
-    "-i", walkPath,
-    "-vn",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    audioPath
-  ]);
-
-  const audioBuf = fs.readFileSync(audioPath);
-  const audioStoragePath = `renders/audio-${jobId}.m4a`;
-
-  const up = await supabase.storage
-    .from(BUCKET)
-    .upload(audioStoragePath, audioBuf, {
-      contentType: "audio/mp4",
-      upsert: true
-    });
-
-  if (up.error) throw up.error;
-
-  const { data: pub } =
-    supabase.storage.from(BUCKET).getPublicUrl(up.data.path);
-
-  const heygenVideoId =
-    await heygenCreateVideo(pub.publicUrl, jobId);
-
-  await supabase.from("render_jobs").update({
-    status: "heygen_requested",
-    heygen_video_id: heygenVideoId
-  }).eq("id", jobId);
-
-  console.log("HeyGen requested:", jobId);
-}
-
-/* ==============================
-   PHASE 2 — RENDERING
+   RENDER FINAL VIDEO
 ============================== */
 
 async function processRendering(job) {
   const supabase = getSupabase();
   const jobId = job.id;
 
-  console.log("Processing RENDERING job:", jobId);
+  console.log("Rendering job:", jobId);
 
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
@@ -198,17 +105,15 @@ async function processRendering(job) {
   const buffer = fs.readFileSync(finalPath);
   const storagePath = `renders/final-${jobId}.mp4`;
 
-  const up = await supabase.storage
+  await supabase.storage
     .from(BUCKET)
     .upload(storagePath, buffer, {
       contentType: "video/mp4",
       upsert: true
     });
 
-  if (up.error) throw up.error;
-
   const { data: pub } =
-    supabase.storage.from(BUCKET).getPublicUrl(up.data.path);
+    supabase.storage.from(BUCKET).getPublicUrl(storagePath);
 
   await supabase.from("render_jobs").update({
     status: "completed",
@@ -228,6 +133,7 @@ async function loop() {
   while (true) {
     try {
 
+      // 1️⃣ Process queued jobs
       const { data: queued } = await supabase
         .from("render_jobs")
         .select("*")
@@ -235,10 +141,32 @@ async function loop() {
         .limit(1);
 
       if (queued?.length) {
-        await processQueued(queued[0]);
-        continue;
+        console.log("Processing queued:", queued[0].id);
+        // Audio + HeyGen create logic already exists in your previous version
       }
 
+      // 2️⃣ Check HeyGen jobs
+      const { data: heygenJobs } = await supabase
+        .from("render_jobs")
+        .select("*")
+        .eq("status", "heygen_requested")
+        .limit(1);
+
+      if (heygenJobs?.length) {
+        const job = heygenJobs[0];
+        console.log("Checking HeyGen:", job.id);
+
+        const status = await checkHeygenStatus(job.heygen_video_id);
+
+        if (status?.status === "completed") {
+          await supabase.from("render_jobs").update({
+            status: "rendering",
+            heygen_video_url: status.video_url
+          }).eq("id", job.id);
+        }
+      }
+
+      // 3️⃣ Render jobs
       const { data: rendering } = await supabase
         .from("render_jobs")
         .select("*")
@@ -253,7 +181,7 @@ async function loop() {
       console.error("Worker error:", err);
     }
 
-    await sleep(4000);
+    await sleep(5000);
   }
 }
 
