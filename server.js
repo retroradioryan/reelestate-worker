@@ -100,22 +100,23 @@ app.get("/job/:id", async (req, res) => {
 });
 
 /* ==============================
-   HEYGEN WEBHOOK (FINAL CORRECT VERSION)
+   HEYGEN WEBHOOK (CORRECT STRUCTURE)
 ============================== */
 
 app.post("/heygen-callback", async (req, res) => {
   try {
     console.log("WEBHOOK RECEIVED:", req.body);
 
-    const videoId = req.body?.data?.video_id;
-    const status = req.body?.data?.status;
-    const videoUrl = req.body?.data?.video_url;
+    const eventType = req.body?.event_type;
+    const videoId = req.body?.event_data?.video_id;
+    const videoUrl = req.body?.event_data?.url;
 
     if (!videoId) {
-      return res.json({ ok: true }); // Ignore malformed events
+      return res.json({ ok: true });
     }
 
-    if (status === "completed" && videoUrl) {
+    // Only handle completed MP4 event
+    if (eventType === "avatar_video.success" && videoUrl) {
 
       await supabase
         .from("render_jobs")
@@ -141,6 +142,7 @@ app.post("/heygen-callback", async (req, res) => {
 ============================== */
 
 const PORT = process.env.PORT || 10000;
+
 app.listen(PORT, () => {
   console.log(`API running on port ${PORT}`);
 });
