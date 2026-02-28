@@ -9,9 +9,9 @@ import fetch from "node-fetch";
 ============================== */
 
 function mustEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing env var: ${name}`);
+  return value;
 }
 
 function getSupabase() {
@@ -22,7 +22,7 @@ function getSupabase() {
 }
 
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ==============================
    FILE DOWNLOAD
@@ -56,10 +56,10 @@ function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", args);
 
-    ff.stderr.on("data", d => console.log(d.toString()));
+    ff.stderr.on("data", (d) => console.log(d.toString()));
     ff.on("error", reject);
 
-    ff.on("close", code => {
+    ff.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`FFmpeg exited with code ${code}`));
     });
@@ -67,12 +67,11 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN CREATE (WITH CALLBACK)
+   HEYGEN CREATE (WITH WEBHOOK)
 ============================== */
 
 async function heygenCreateVideo(audioUrl, jobId) {
-
-  const callbackUrl =
+  const webhookUrl =
     `https://reelestate-api-9oob.onrender.com/heygen-callback` +
     `?job_id=${jobId}` +
     `&token=${mustEnv("HEYGEN_WEBHOOK_SECRET")}`;
@@ -83,26 +82,28 @@ async function heygenCreateVideo(audioUrl, jobId) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Api-Key": mustEnv("HEYGEN_API_KEY")
+        "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
       },
       body: JSON.stringify({
-        video_inputs: [{
-          character: {
-            type: "avatar",
-            avatar_id: mustEnv("HEYGEN_AVATAR_ID")
+        video_inputs: [
+          {
+            character: {
+              type: "avatar",
+              avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
+            },
+            voice: {
+              type: "audio",
+              audio_url: audioUrl,
+            },
+            background: {
+              type: "color",
+              value: "#00FF00",
+            },
           },
-          voice: {
-            type: "audio",
-            audio_url: audioUrl
-          },
-          background: {
-            type: "color",
-            value: "#00FF00"
-          }
-        }],
+        ],
         dimension: { width: 1080, height: 1920 },
-        callback_url: callbackUrl
-      })
+        webhook_url: webhookUrl, // ✅ CORRECT FIELD NAME
+      }),
     }
   );
 
@@ -112,7 +113,15 @@ async function heygenCreateVideo(audioUrl, jobId) {
   }
 
   const json = await resp.json();
-  return json?.data?.video_id;
+  const videoId = json?.data?.video_id;
+
+  console.log("HEYGEN VIDEO ID:", videoId);
+
+  if (!videoId) {
+    throw new Error("HeyGen did not return a video_id");
+  }
+
+  return videoId;
 }
 
 /* ==============================
@@ -133,32 +142,40 @@ async function processQueued(job) {
 
   await runFFmpeg([
     "-y",
-    "-i", walkPath,
+    "-i",
+    walkPath,
     "-vn",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    audioPath
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    audioPath,
   ]);
 
   const audioBuffer = fs.readFileSync(audioPath);
   const storagePath = `renders/audio-${jobId}.m4a`;
 
-  await supabase.storage
+  const upload = await supabase.storage
     .from(BUCKET)
     .upload(storagePath, audioBuffer, {
       contentType: "audio/mp4",
-      upsert: true
+      upsert: true,
     });
+
+  if (upload.error) throw upload.error;
 
   const { data: pub } =
     supabase.storage.from(BUCKET).getPublicUrl(storagePath);
 
   const videoId = await heygenCreateVideo(pub.publicUrl, jobId);
 
-  await supabase.from("render_jobs").update({
-    status: "heygen_requested",
-    heygen_video_id: videoId
-  }).eq("id", jobId);
+  await supabase
+    .from("render_jobs")
+    .update({
+      status: "heygen_requested",
+      heygen_video_id: videoId,
+    })
+    .eq("id", jobId);
 }
 
 /* ==============================
@@ -181,39 +198,53 @@ async function processRendering(job) {
 
   await runFFmpeg([
     "-y",
-    "-i", walkPath,
-    "-i", avatarPath,
+    "-i",
+    walkPath,
+    "-i",
+    avatarPath,
     "-filter_complex",
     "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[vbg];" +
-    "[1:v]scale=iw*0.5:-2,chromakey=0x00FF00:0.18:0.08[fg];" +
-    "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
-    "-map", "[outv]",
-    "-map", "1:a?",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "28",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    finalPath
+      "[1:v]scale=iw*0.5:-2,chromakey=0x00FF00:0.18:0.08[fg];" +
+      "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
+    "-map",
+    "[outv]",
+    "-map",
+    "1:a?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "28",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    finalPath,
   ]);
 
   const buffer = fs.readFileSync(finalPath);
   const storagePath = `renders/final-${jobId}.mp4`;
 
-  await supabase.storage
+  const upload = await supabase.storage
     .from(BUCKET)
     .upload(storagePath, buffer, {
       contentType: "video/mp4",
-      upsert: true
+      upsert: true,
     });
+
+  if (upload.error) throw upload.error;
 
   const { data: pub } =
     supabase.storage.from(BUCKET).getPublicUrl(storagePath);
 
-  await supabase.from("render_jobs").update({
-    status: "completed",
-    final_public_url: pub.publicUrl
-  }).eq("id", jobId);
+  await supabase
+    .from("render_jobs")
+    .update({
+      status: "completed",
+      final_public_url: pub.publicUrl,
+    })
+    .eq("id", jobId);
 
   console.log("Completed:", jobId);
 }
@@ -227,7 +258,7 @@ async function loop() {
 
   while (true) {
     try {
-
+      // Phase 1
       const { data: queued } = await supabase
         .from("render_jobs")
         .select("*")
@@ -239,6 +270,7 @@ async function loop() {
         continue;
       }
 
+      // Phase 2 (render after webhook updates status)
       const { data: rendering } = await supabase
         .from("render_jobs")
         .select("*")
@@ -248,7 +280,6 @@ async function loop() {
       if (rendering?.length) {
         await processRendering(rendering[0]);
       }
-
     } catch (err) {
       console.error("Worker error:", err);
     }
