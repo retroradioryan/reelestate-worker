@@ -67,10 +67,16 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN CREATE
+   HEYGEN CREATE (WITH CALLBACK)
 ============================== */
 
-async function heygenCreateVideo(audioUrl) {
+async function heygenCreateVideo(audioUrl, jobId) {
+
+  const callbackUrl =
+    `https://reelestate-api-9oob.onrender.com/heygen-callback` +
+    `?job_id=${jobId}` +
+    `&token=${mustEnv("HEYGEN_WEBHOOK_SECRET")}`;
+
   const resp = await fetch(
     "https://api.heygen.com/v2/video/generate",
     {
@@ -94,7 +100,8 @@ async function heygenCreateVideo(audioUrl) {
             value: "#00FF00"
           }
         }],
-        dimension: { width: 1080, height: 1920 }
+        dimension: { width: 1080, height: 1920 },
+        callback_url: callbackUrl
       })
     }
   );
@@ -109,32 +116,7 @@ async function heygenCreateVideo(audioUrl) {
 }
 
 /* ==============================
-   HEYGEN STATUS (CORRECT)
-============================== */
-
-async function checkHeygenStatus(videoId) {
-  const resp = await fetch(
-    `https://api.heygen.com/v2/video/status?video_id=${videoId}`,
-    {
-      method: "GET",
-      headers: {
-        "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
-        "Accept": "application/json"
-      }
-    }
-  );
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`HeyGen status error: ${resp.status} ${text}`);
-  }
-
-  const json = await resp.json();
-  return json?.data;
-}
-
-/* ==============================
-   PHASE 1 — QUEUED
+   PHASE 1 — PROCESS QUEUED
 ============================== */
 
 async function processQueued(job) {
@@ -171,7 +153,7 @@ async function processQueued(job) {
   const { data: pub } =
     supabase.storage.from(BUCKET).getPublicUrl(storagePath);
 
-  const videoId = await heygenCreateVideo(pub.publicUrl);
+  const videoId = await heygenCreateVideo(pub.publicUrl, jobId);
 
   await supabase.from("render_jobs").update({
     status: "heygen_requested",
@@ -180,26 +162,7 @@ async function processQueued(job) {
 }
 
 /* ==============================
-   PHASE 2 — POLL HEYGEN
-============================== */
-
-async function processHeygen(job) {
-  const supabase = getSupabase();
-
-  console.log("Checking HeyGen:", job.id);
-
-  const data = await checkHeygenStatus(job.heygen_video_id);
-
-  if (data?.status === "completed") {
-    await supabase.from("render_jobs").update({
-      status: "rendering",
-      heygen_video_url: data.video_url
-    }).eq("id", job.id);
-  }
-}
-
-/* ==============================
-   PHASE 3 — FINAL RENDER
+   PHASE 2 — PROCESS RENDERING
 ============================== */
 
 async function processRendering(job) {
@@ -273,17 +236,6 @@ async function loop() {
 
       if (queued?.length) {
         await processQueued(queued[0]);
-        continue;
-      }
-
-      const { data: heygen } = await supabase
-        .from("render_jobs")
-        .select("*")
-        .eq("status", "heygen_requested")
-        .limit(1);
-
-      if (heygen?.length) {
-        await processHeygen(heygen[0]);
         continue;
       }
 
