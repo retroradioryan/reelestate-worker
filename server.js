@@ -1,4 +1,3 @@
-
 import express from "express";
 import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
@@ -7,12 +6,12 @@ import path from "path";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
 /* -----------------------------
-  HELPERS
-------------------------------*/
+   ENV + SUPABASE
+----------------------------- */
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -26,6 +25,19 @@ function getSupabase() {
   return createClient(url, key);
 }
 
+function heygenHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
+  };
+}
+
+const BUCKET = process.env.STORAGE_BUCKET || "videos";
+
+/* -----------------------------
+   HELPERS
+----------------------------- */
+
 async function downloadToFile(fileUrl, outPath) {
   const resp = await fetch(fileUrl);
   if (!resp.ok) throw new Error(`Download failed: ${resp.status} (${fileUrl})`);
@@ -38,82 +50,107 @@ async function downloadToFile(fileUrl, outPath) {
   });
 }
 
-function runCmd(bin, args) {
+function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
-    const p = spawn(bin, args);
-    let stdout = "";
-    p.stdout.on("data", (d) => (stdout += d.toString()));
-    p.stderr.on("data", (d) => console.log(d.toString()));
-    p.on("close", (code) => {
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`${bin} exited with code ${code}`));
+    const ff = spawn("ffmpeg", args);
+    ff.stderr.on("data", (d) => console.log(d.toString()));
+    ff.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`FFmpeg exited with code ${code}`));
     });
   });
 }
 
-function runFFmpeg(args) {
-  return runCmd("ffmpeg", args);
+function runFFprobeJSON(args) {
+  return new Promise((resolve, reject) => {
+    const fp = spawn("ffprobe", args);
+    let out = "";
+    let err = "";
+    fp.stdout.on("data", (d) => (out += d.toString()));
+    fp.stderr.on("data", (d) => (err += d.toString()));
+    fp.on("close", (code) => {
+      if (code !== 0) return reject(new Error(`ffprobe failed: ${err}`));
+      try {
+        resolve(JSON.parse(out));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
 }
 
-async function getRotationDegrees(videoPath) {
-  // Reads rotation metadata if present (e.g. WhatsApp videos)
+async function detectRotationDegrees(videoPath) {
+  // Reads rotation metadata if present (WhatsApp often stores -90)
   try {
-    const out = await runCmd("ffprobe", [
+    const json = await runFFprobeJSON([
       "-v",
       "error",
-      "-select_streams",
-      "v:0",
-      "-show_entries",
-      "stream_tags=rotate",
-      "-of",
-      "default=nw=1:nk=1",
+      "-print_format",
+      "json",
+      "-show_streams",
       videoPath,
     ]);
-    const s = (out || "").trim();
-    const deg = parseInt(s, 10);
-    if (Number.isFinite(deg)) return deg;
+
+    const vStream = (json.streams || []).find((s) => s.codec_type === "video");
+    const tags = vStream?.tags || {};
+    const rotateTag = tags.rotate;
+
+    if (rotateTag !== undefined) {
+      const n = parseInt(rotateTag, 10);
+      if (!Number.isNaN(n)) return n;
+    }
+
+    // Sometimes stored in side_data_list
+    const side = vStream?.side_data_list || [];
+    for (const sd of side) {
+      if (sd.rotation !== undefined) {
+        const n = parseInt(sd.rotation, 10);
+        if (!Number.isNaN(n)) return n;
+      }
+    }
+
     return 0;
   } catch {
     return 0;
   }
 }
 
-function heygenHeaders() {
-  // Docs: API uses X-API-KEY header. :contentReference[oaicite:0]{index=0}
-  const apiKey = mustEnv("HEYGEN_API_KEY");
-  return { "Content-Type": "application/json", "X-API-KEY": apiKey };
-}
-
-async function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function rotationFilter(deg) {
+  // Convert common rotate metadata into actual pixels rotation
+  // We zero metadata later by re-encode anyway.
+  if (deg === 90) return "transpose=1"; // clockwise
+  if (deg === -90 || deg === 270) return "transpose=2"; // counterclockwise
+  if (deg === 180 || deg === -180) return "hflip,vflip";
+  return ""; // no rotation needed
 }
 
 /* -----------------------------
-  HEYGEN: CREATE + POLL
-------------------------------*/
+   HEYGEN: CREATE VIDEO (async)
+----------------------------- */
 
-async function heygenCreateVideoFromAudio({ avatarId, audioUrl, maxSeconds }) {
-  // Create a Video endpoint exists in HeyGen API Reference (Video Generation). :contentReference[oaicite:1]{index=1}
-  // This payload format matches HeyGen “video_inputs” structure used in v2 generation flows.
+async function heygenCreateVideo({ audioUrl, maxSeconds, callbackUrl }) {
+  const avatarId = mustEnv("HEYGEN_AVATAR_ID");
+
+  // NOTE: HeyGen supports callback/webhook on many plans.
+  // If your account uses a different field name, this is the ONLY line to adjust.
   const body = {
     video_inputs: [
       {
         character: {
           type: "avatar",
           avatar_id: avatarId,
+          avatar_style: "normal",
         },
         voice: {
           type: "audio",
-          audio_url: audioUrl,
+          audio_url: audioUrl, // avatar will speak this audio
         },
-        background: {
-          type: "color",
-          value: "#00FF00",
-        },
+        background: { type: "color", value: "#00FF00" },
       },
     ],
     dimension: { width: 1080, height: 1920 },
-    duration: Number(maxSeconds),
+    duration: maxSeconds,
+    callback_url: callbackUrl,
   };
 
   const resp = await fetch("https://api.heygen.com/v2/video/generate", {
@@ -123,57 +160,30 @@ async function heygenCreateVideoFromAudio({ avatarId, audioUrl, maxSeconds }) {
   });
 
   const json = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(`HeyGen create failed: ${resp.status} ${JSON.stringify(json)}`);
+  if (!resp.ok) {
+    throw new Error(`HeyGen create failed: ${resp.status} ${JSON.stringify(json)}`);
+  }
 
-  const videoId = json?.data?.video_id || json?.data?.id || json?.video_id || json?.id;
-  if (!videoId) throw new Error(`HeyGen returned no video_id: ${JSON.stringify(json)}`);
+  const videoId = json?.data?.video_id || json?.video_id || json?.data?.id || json?.id;
+  if (!videoId) throw new Error(`HeyGen create returned no video_id: ${JSON.stringify(json)}`);
   return videoId;
 }
 
-async function heygenPollVideoUrl(videoId) {
-  // Get Video Status/Details endpoint listed in docs. :contentReference[oaicite:2]{index=2}
-  // Many 404s happen when hitting the wrong path — this is the documented one.
-  const statusUrl = `https://api.heygen.com/v1/video_status.get?video_id=${encodeURIComponent(videoId)}`;
-
-  for (let i = 0; i < 120; i++) {
-    const resp = await fetch(statusUrl, { headers: heygenHeaders() });
-    const json = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(`HeyGen status failed: ${resp.status} ${JSON.stringify(json)}`);
-
-    const status = json?.data?.status || json?.status;
-    const videoUrl = json?.data?.video_url || json?.data?.url || json?.video_url || json?.url;
-
-    if (status === "completed" && videoUrl) return videoUrl;
-    if (status === "failed") throw new Error(`HeyGen failed: ${JSON.stringify(json)}`);
-
-    await sleep(2000);
-  }
-
-  throw new Error("HeyGen timed out waiting for completion");
-}
-
 /* -----------------------------
-  HEALTH
-------------------------------*/
+   HEALTH
+----------------------------- */
 
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "reelestate-worker" });
 });
 
 /* -----------------------------
-  COMPOSE WALKTHROUGH (FAST)
-  - walkthroughUrl (video)
-  - logoUrl (png)
-  - maxSeconds (default 30)
-  Uses env:
-   - HEYGEN_API_KEY
-   - HEYGEN_AVATAR_ID  (IMPORTANT)
-   - SUPABASE_URL
-   - SUPABASE_SERVICE_ROLE_KEY
-   - STORAGE_BUCKET (optional, default "videos")
-------------------------------*/
+   START JOB (returns immediately)
+----------------------------- */
 
 app.post("/compose-walkthrough", async (req, res) => {
+  const supabase = getSupabase();
+
   try {
     const { walkthroughUrl, logoUrl, maxSeconds = 30 } = req.body;
 
@@ -184,30 +194,33 @@ app.post("/compose-walkthrough", async (req, res) => {
       });
     }
 
-    const supabase = getSupabase();
-    const bucket = process.env.STORAGE_BUCKET || "videos";
-    const avatarId = mustEnv("HEYGEN_AVATAR_ID");
+    const baseUrl = mustEnv("PUBLIC_BASE_URL");
+    const secret = mustEnv("HEYGEN_WEBHOOK_SECRET");
 
+    // 1) Create job row
+    const { data: job, error: jobErr } = await supabase
+      .from("render_jobs")
+      .insert({
+        status: "queued",
+        walkthrough_url: walkthroughUrl,
+        logo_url: logoUrl,
+        max_seconds: maxSeconds,
+      })
+      .select("*")
+      .single();
+
+    if (jobErr) throw jobErr;
+
+    const jobId = job.id;
+
+    // 2) Download walkthrough to extract audio
     const tmp = "/tmp";
-    const id = Date.now();
+    const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
+    const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
 
-    const walkPath = path.join(tmp, `walk-${id}.mp4`);
-    const logoPath = path.join(tmp, `logo-${id}.png`);
-
-    const audioPath = path.join(tmp, `audio-${id}.m4a`);
-    const heygenPath = path.join(tmp, `heygen-${id}.mp4`);
-
-    const mainPath = path.join(tmp, `main-${id}.mp4`);
-    const introPath = path.join(tmp, `intro-${id}.mp4`);
-    const outroPath = path.join(tmp, `outro-${id}.mp4`);
-    const finalPath = path.join(tmp, `final-${id}.mp4`);
-    const listPath = path.join(tmp, `list-${id}.txt`);
-
-    // 1) Download assets
     await downloadToFile(walkthroughUrl, walkPath);
-    await downloadToFile(logoUrl, logoPath);
 
-    // 2) Extract audio (re-encode to AAC for max compatibility with HeyGen)
+    // Extract audio (fast)
     await runFFmpeg([
       "-y",
       "-i",
@@ -215,10 +228,6 @@ app.post("/compose-walkthrough", async (req, res) => {
       "-t",
       String(maxSeconds),
       "-vn",
-      "-ac",
-      "2",
-      "-ar",
-      "48000",
       "-c:a",
       "aac",
       "-b:a",
@@ -226,169 +235,266 @@ app.post("/compose-walkthrough", async (req, res) => {
       audioPath,
     ]);
 
-    // 3) Upload audio to Supabase → public URL for HeyGen
+    // 3) Upload audio so HeyGen can fetch it
     const audioBuf = fs.readFileSync(audioPath);
-    const audioStoragePath = `renders/audio-${id}.m4a`;
+    const audioStoragePath = `renders/audio-${jobId}.m4a`;
 
-    const upAudio = await supabase.storage.from(bucket).upload(audioStoragePath, audioBuf, {
+    const upAudio = await supabase.storage.from(BUCKET).upload(audioStoragePath, audioBuf, {
       contentType: "audio/mp4",
       upsert: true,
     });
     if (upAudio.error) throw upAudio.error;
 
-    const { data: audioPublic } = supabase.storage.from(bucket).getPublicUrl(upAudio.data.path);
-    const audioUrl = audioPublic.publicUrl;
+    const { data: audioPublic } = supabase.storage.from(BUCKET).getPublicUrl(upAudio.data.path);
 
-    // 4) HeyGen: create avatar video using that audio (green bg)
-    const videoId = await heygenCreateVideoFromAudio({ avatarId, audioUrl, maxSeconds });
-    const heygenVideoUrl = await heygenPollVideoUrl(videoId);
+    // 4) Tell HeyGen to generate + callback to us
+    const callbackUrl = `${baseUrl}/heygen-callback?token=${encodeURIComponent(secret)}&job_id=${jobId}`;
 
-    // 5) Download HeyGen result mp4
-    await downloadToFile(heygenVideoUrl, heygenPath);
+    const heygenVideoId = await heygenCreateVideo({
+      audioUrl: audioPublic.publicUrl,
+      maxSeconds,
+      callbackUrl,
+    });
 
-    // 6) Fix orientation based on rotation metadata
-    const rot = await getRotationDegrees(walkPath);
-    // If WhatsApp says -90, that’s typically 270; we need a transpose.
-    // We only apply when needed (prevents over-rotating “normal” videos).
-    let rotFilter = "";
-    if (rot === 90) rotFilter = "transpose=1,";
-    else if (rot === -90 || rot === 270) rotFilter = "transpose=2,";
-    else if (rot === 180 || rot === -180) rotFilter = "hflip,vflip,";
+    await supabase.from("render_jobs").update({
+      status: "heygen_requested",
+      audio_storage_path: audioStoragePath,
+      audio_public_url: audioPublic.publicUrl,
+      heygen_video_id: heygenVideoId,
+    }).eq("id", jobId);
 
-    // 7) Compose main (fast settings)
-    // - walkthrough becomes full 1080x1920
-    // - avatar key is stronger and fg alpha forced to 1 (less transparent)
-    // - shadow for grounding (less “floating”)
+    // Return immediately (NO TIMEOUT)
+    return res.json({
+      ok: true,
+      job_id: jobId,
+      heygen_video_id: heygenVideoId,
+      status_url: `${baseUrl}/job/${jobId}`,
+    });
+  } catch (err) {
+    console.error("START JOB ERROR:", err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/* -----------------------------
+   CHECK JOB STATUS
+----------------------------- */
+
+app.get("/job/:id", async (req, res) => {
+  const supabase = getSupabase();
+  const id = Number(req.params.id);
+
+  const { data, error } = await supabase.from("render_jobs").select("*").eq("id", id).single();
+  if (error) return res.status(404).json({ ok: false, error: String(error) });
+
+  res.json({ ok: true, job: data });
+});
+
+/* -----------------------------
+   HEYGEN CALLBACK (does the heavy work)
+   This is where we compose + upload final.
+----------------------------- */
+
+app.post("/heygen-callback", async (req, res) => {
+  const supabase = getSupabase();
+
+  try {
+    // Validate token
+    const token = req.query.token;
+    const jobId = Number(req.query.job_id);
+
+    if (!token || token !== mustEnv("HEYGEN_WEBHOOK_SECRET")) {
+      return res.status(401).json({ ok: false, error: "Invalid token" });
+    }
+    if (!jobId) {
+      return res.status(400).json({ ok: false, error: "Missing job_id" });
+    }
+
+    // Parse HeyGen payload variations
+    const payload = req.body || {};
+    const status = payload?.data?.status || payload?.status;
+    const videoId = payload?.data?.video_id || payload?.video_id;
+    const videoUrl =
+      payload?.data?.video_url ||
+      payload?.data?.url ||
+      payload?.video_url ||
+      payload?.url;
+
+    console.log("HEYGEN CALLBACK:", { jobId, status, videoId, hasUrl: !!videoUrl });
+
+    // Update job row with what we got
+    await supabase.from("render_jobs").update({
+      status: status === "completed" ? "heygen_completed" : "heygen_requested",
+      heygen_video_url: videoUrl || null,
+    }).eq("id", jobId);
+
+    // If not completed yet, accept callback (some systems send multiple)
+    if (status && status !== "completed") {
+      return res.json({ ok: true, received: true, status });
+    }
+
+    if (!videoUrl) {
+      // Some accounts send callback without URL. In that case you must poll HeyGen status.
+      // But you asked for callback architecture — so we fail loudly here.
+      await supabase.from("render_jobs").update({
+        status: "failed",
+        error: "HeyGen callback missing video_url. Your account may not include video_url in callback payload.",
+      }).eq("id", jobId);
+
+      return res.status(500).json({ ok: false, error: "Callback missing video_url" });
+    }
+
+    // Load job
+    const { data: job, error: jobErr } = await supabase
+      .from("render_jobs")
+      .select("*")
+      .eq("id", jobId)
+      .single();
+
+    if (jobErr) throw jobErr;
+
+    await supabase.from("render_jobs").update({ status: "rendering" }).eq("id", jobId);
+
+    const tmp = "/tmp";
+    const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
+    const avatarPath = path.join(tmp, `avatar-${jobId}.mp4`);
+    const logoPath = path.join(tmp, `logo-${jobId}.png`);
+
+    const mainPath = path.join(tmp, `main-${jobId}.mp4`);
+    const introPath = path.join(tmp, `intro-${jobId}.mp4`);
+    const outroPath = path.join(tmp, `outro-${jobId}.mp4`);
+    const finalPath = path.join(tmp, `final-${jobId}.mp4`);
+
+    // Download assets
+    await downloadToFile(job.walkthrough_url, walkPath);
+    await downloadToFile(videoUrl, avatarPath);
+    await downloadToFile(job.logo_url, logoPath);
+
+    // Fix orientation based on rotation metadata
+    const rot = await detectRotationDegrees(walkPath);
+    const rotVF = rotationFilter(rot);
+    const rotPrefix = rotVF ? `${rotVF},` : "";
+
+    // MAIN COMPOSE (FAST)
+    // - walkthrough becomes vertical 1080x1920
+    // - avatar greenscreen keyed
+    // - avatar larger + less “transparent”
     const filter =
-      `[0:v]${rotFilter}scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[vbg];` +
-      `[1:v]scale=iw*0.52:-2,chromakey=0x00FF00:0.12:0.05,format=rgba,colorchannelmixer=aa=1.0[fg];` +
-      `[fg]split[fgA][fgB];` +
-      `[fgA]colorchannelmixer=aa=0.55,boxblur=14:6[shadow];` +
-      `[vbg][shadow]overlay=W-w-78:H-h-118[bgshadow];` +
-      `[bgshadow][fgB]overlay=W-w-70:H-h-110[outv]`;
+      `[0:v]${rotPrefix}scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[vbg];` +
+      `[1:v]scale=iw*0.55:-2,chromakey=0x00FF00:0.16:0.06,format=rgba[fg];` +
+      `[fg]split[fg1][fg2];` +
+      `[fg1]colorchannelmixer=aa=0.70,boxblur=8:4[shadow];` +
+      `[vbg][shadow]overlay=W-w-70:H-h-110[bgshadow];` +
+      `[bgshadow][fg2]overlay=W-w-62:H-h-102[outv]`;
 
     await runFFmpeg([
       "-y",
-      "-t",
-      String(maxSeconds),
-      "-i",
-      walkPath,
-      "-i",
-      heygenPath,
-      "-filter_complex",
-      filter,
-      "-map",
-      "[outv]",
-      "-map",
-      "1:a?",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-crf",
-      "30",
-      "-pix_fmt",
-      "yuv420p",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
+      "-t", String(job.max_seconds || 30),
+      "-i", walkPath,
+      "-i", avatarPath,
+      "-filter_complex", filter,
+      "-map", "[outv]",
+      "-map", "1:a?",              // avatar audio (which is your walkthrough audio)
+      "-c:v", "libx264",
+      "-preset", "ultrafast",      // FASTEST
+      "-crf", "28",
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-b:a", "128k",
       mainPath,
     ]);
 
-    // 8) Intro/outro full screen logo (1.5s)
-    // Make logo BIG and centered; black background; quick fade
+    // INTRO/OUTRO full screen logo (1.5s)
     const introOutroVF =
-      "scale=1080:-1:force_original_aspect_ratio=decrease," +
-      "pad=1080:1920:(1080-iw)/2:(1920-ih)/2:color=black," +
-      "fade=t=in:st=0:d=0.25,fade=t=out:st=1.25:d=0.25";
+      "scale=900:-1,format=rgba," +
+      "fade=t=in:st=0:d=0.25,fade=t=out:st=1.25:d=0.25," +
+      "pad=1080:1920:(1080-iw)/2:(1920-ih)/2:color=black";
 
     await runFFmpeg([
       "-y",
-      "-loop",
-      "1",
-      "-i",
-      logoPath,
-      "-t",
-      "1.5",
-      "-vf",
-      introOutroVF,
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-crf",
-      "30",
-      "-pix_fmt",
-      "yuv420p",
+      "-loop", "1",
+      "-i", logoPath,
+      "-t", "1.5",
+      "-vf", introOutroVF,
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-crf", "28",
+      "-pix_fmt", "yuv420p",
       introPath,
     ]);
 
     await runFFmpeg([
       "-y",
-      "-loop",
-      "1",
-      "-i",
-      logoPath,
-      "-t",
-      "1.5",
-      "-vf",
-      introOutroVF,
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-crf",
-      "30",
-      "-pix_fmt",
-      "yuv420p",
+      "-loop", "1",
+      "-i", logoPath,
+      "-t", "1.5",
+      "-vf", introOutroVF,
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-crf", "28",
+      "-pix_fmt", "yuv420p",
       outroPath,
     ]);
 
-    // 9) Concat intro + main + outro (re-encode once, fastest)
+    // CONCAT (intro + main + outro)
+    const listPath = path.join(tmp, `list-${jobId}.txt`);
     fs.writeFileSync(listPath, `file '${introPath}'\nfile '${mainPath}'\nfile '${outroPath}'\n`);
 
     await runFFmpeg([
       "-y",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      listPath,
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-crf",
-      "30",
-      "-pix_fmt",
-      "yuv420p",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", listPath,
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-crf", "28",
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-b:a", "128k",
       finalPath,
     ]);
 
-    // 10) Upload final mp4
+    // Upload final
     const buffer = fs.readFileSync(finalPath);
-    const storagePath = `renders/walkthrough-${id}.mp4`;
+    const storagePath = `renders/walkthrough-${jobId}.mp4`;
 
-    const up = await supabase.storage.from(bucket).upload(storagePath, buffer, {
+    const up = await supabase.storage.from(BUCKET).upload(storagePath, buffer, {
       contentType: "video/mp4",
       upsert: true,
     });
     if (up.error) throw up.error;
 
-    const { data: publicUrl } = supabase.storage.from(bucket).getPublicUrl(up.data.path);
+    const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(up.data.path);
 
-    res.json({ ok: true, url: publicUrl.publicUrl });
+    await supabase.from("render_jobs").update({
+      status: "completed",
+      final_storage_path: storagePath,
+      final_public_url: pub.publicUrl,
+    }).eq("id", jobId);
+
+    return res.json({ ok: true, job_id: jobId, final_url: pub.publicUrl });
   } catch (err) {
-    console.error("ERROR:", err);
-    res.status(500).json({ ok: false, error: String(err) });
+    console.error("CALLBACK ERROR:", err);
+
+    // Best effort: mark job failed if we can
+    try {
+      const supabase = getSupabase();
+      const jobId = Number(req.query.job_id);
+      if (jobId) {
+        await supabase.from("render_jobs").update({
+          status: "failed",
+          error: String(err),
+        }).eq("id", jobId);
+      }
+    } catch {}
+
+    return res.status(500).json({ ok: false, error: String(err) });
   }
 });
+
+/* -----------------------------
+   START SERVER
+----------------------------- */
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Worker running on port ${PORT}`));
