@@ -1,4 +1,4 @@
-cat > server.js <<'EOF'
+
 import express from "express";
 import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
@@ -392,4 +392,3 @@ app.post("/compose-walkthrough", async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Worker running on port ${PORT}`));
-EOF
