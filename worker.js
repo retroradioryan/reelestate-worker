@@ -4,6 +4,10 @@ import fs from "fs";
 import path from "path";
 import fetch from "node-fetch";
 
+/* ==============================
+   ENV
+============================== */
+
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -19,11 +23,19 @@ function getSupabase() {
 
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 
+/* ==============================
+   HELPERS
+============================== */
+
 async function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
 async function downloadToFile(url, outPath) {
+  if (!url || !url.startsWith("http")) {
+    throw new Error(`Invalid download URL: ${url}`);
+  }
+
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
 
@@ -48,11 +60,16 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN CREATE
+   HEYGEN
 ============================== */
 
 async function heygenCreateVideo(audioUrl, jobId) {
   const avatarId = mustEnv("HEYGEN_AVATAR_ID");
+  const baseUrl = mustEnv("PUBLIC_BASE_URL");
+  const secret = mustEnv("HEYGEN_WEBHOOK_SECRET");
+
+  const callbackUrl =
+    `${baseUrl}/heygen-callback?token=${secret}&job_id=${jobId}`;
 
   const body = {
     video_inputs: [{
@@ -69,7 +86,8 @@ async function heygenCreateVideo(audioUrl, jobId) {
         value: "#00FF00"
       }
     }],
-    dimension: { width: 1080, height: 1920 }
+    dimension: { width: 1080, height: 1920 },
+    callback_url: callbackUrl
   };
 
   const resp = await fetch(
@@ -91,7 +109,7 @@ async function heygenCreateVideo(audioUrl, jobId) {
 }
 
 /* ==============================
-   PROCESS QUEUED JOB
+   PHASE 1 — QUEUED
 ============================== */
 
 async function processQueued(job) {
@@ -137,10 +155,12 @@ async function processQueued(job) {
     status: "heygen_requested",
     heygen_video_id: heygenVideoId
   }).eq("id", jobId);
+
+  console.log("HeyGen requested:", jobId);
 }
 
 /* ==============================
-   PROCESS RENDERING JOB
+   PHASE 2 — RENDERING
 ============================== */
 
 async function processRendering(job) {
@@ -208,7 +228,6 @@ async function loop() {
   while (true) {
     try {
 
-      // Phase 1
       const { data: queued } = await supabase
         .from("render_jobs")
         .select("*")
@@ -220,7 +239,6 @@ async function loop() {
         continue;
       }
 
-      // Phase 2
       const { data: rendering } = await supabase
         .from("render_jobs")
         .select("*")
