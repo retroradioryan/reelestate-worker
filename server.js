@@ -7,11 +7,10 @@ import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
-app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
-/* -----------------------------
+/* ==============================
    ENV + SUPABASE
------------------------------ */
+============================== */
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -28,14 +27,13 @@ function getSupabase() {
 
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 
-/* -----------------------------
+/* ==============================
    HELPERS
------------------------------ */
+============================== */
 
-async function downloadToFile(fileUrl, outPath) {
-  const resp = await fetch(fileUrl);
-  if (!resp.ok) throw new Error(`Download failed: ${resp.status} (${fileUrl})`);
-
+async function downloadToFile(url, outPath) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
   await new Promise((resolve, reject) => {
     const stream = fs.createWriteStream(outPath);
     resp.body.pipe(stream);
@@ -50,16 +48,16 @@ function runFFmpeg(args) {
     ff.stderr.on("data", d => console.log(d.toString()));
     ff.on("close", code => {
       if (code === 0) resolve();
-      else reject(new Error(`FFmpeg exited with code ${code}`));
+      else reject(new Error(`FFmpeg exited ${code}`));
     });
   });
 }
 
-/* -----------------------------
+/* ==============================
    HEYGEN CREATE (v2 + webhook)
------------------------------ */
+============================== */
 
-async function heygenCreateVideo({ audioUrl, jobId }) {
+async function heygenCreateVideo(audioUrl, jobId) {
   const avatarId = mustEnv("HEYGEN_AVATAR_ID");
   const baseUrl = mustEnv("PUBLIC_BASE_URL");
   const secret = mustEnv("HEYGEN_WEBHOOK_SECRET");
@@ -68,22 +66,20 @@ async function heygenCreateVideo({ audioUrl, jobId }) {
     `${baseUrl}/heygen-callback?token=${secret}&job_id=${jobId}`;
 
   const body = {
-    video_inputs: [
-      {
-        character: {
-          type: "avatar",
-          avatar_id: avatarId
-        },
-        voice: {
-          type: "audio",
-          audio_url: audioUrl
-        },
-        background: {
-          type: "color",
-          value: "#00FF00"
-        }
+    video_inputs: [{
+      character: {
+        type: "avatar",
+        avatar_id: avatarId
+      },
+      voice: {
+        type: "audio",
+        audio_url: audioUrl
+      },
+      background: {
+        type: "color",
+        value: "#00FF00"
       }
-    ],
+    }],
     dimension: { width: 1080, height: 1920 },
     webhook_url: webhookUrl
   };
@@ -101,42 +97,89 @@ async function heygenCreateVideo({ audioUrl, jobId }) {
   );
 
   const json = await resp.json();
+  if (!resp.ok) throw new Error(JSON.stringify(json));
 
-  if (!resp.ok) {
-    throw new Error(`HeyGen error: ${JSON.stringify(json)}`);
-  }
-
-  const videoId = json?.data?.video_id;
-  if (!videoId) {
-    throw new Error(`No video_id returned: ${JSON.stringify(json)}`);
-  }
-
-  return videoId;
+  return json?.data?.video_id;
 }
 
-/* -----------------------------
-   HEALTH
------------------------------ */
+/* ==============================
+   BACKGROUND RENDER FUNCTION
+============================== */
+
+async function processRender(jobId, videoUrl) {
+  console.log("Background render started:", jobId);
+
+  const supabase = getSupabase();
+
+  const { data: job } = await supabase
+    .from("render_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+
+  const tmp = "/tmp";
+  const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
+  const avatarPath = path.join(tmp, `avatar-${jobId}.mp4`);
+  const finalPath = path.join(tmp, `final-${jobId}.mp4`);
+
+  await downloadToFile(job.walkthrough_url, walkPath);
+  await downloadToFile(videoUrl, avatarPath);
+
+  await runFFmpeg([
+    "-y",
+    "-i", walkPath,
+    "-i", avatarPath,
+    "-filter_complex",
+    "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[vbg];" +
+    "[1:v]scale=iw*0.5:-2,chromakey=0x00FF00:0.18:0.08[fg];" +
+    "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
+    "-map", "[outv]",
+    "-map", "1:a?",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "28",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    finalPath
+  ]);
+
+  const buffer = fs.readFileSync(finalPath);
+  const storagePath = `renders/final-${jobId}.mp4`;
+
+  const up = await supabase.storage
+    .from(BUCKET)
+    .upload(storagePath, buffer, {
+      contentType: "video/mp4",
+      upsert: true
+    });
+
+  if (up.error) throw up.error;
+
+  const { data: pub } =
+    supabase.storage.from(BUCKET).getPublicUrl(up.data.path);
+
+  await supabase.from("render_jobs").update({
+    status: "completed",
+    final_public_url: pub.publicUrl
+  }).eq("id", jobId);
+
+  console.log("Background render finished:", jobId);
+}
+
+/* ==============================
+   ROUTES
+============================== */
 
 app.get("/", (req, res) => {
   res.json({ ok: true });
 });
 
-/* -----------------------------
-   START JOB
------------------------------ */
-
 app.post("/compose-walkthrough", async (req, res) => {
-  const supabase = getSupabase();
-
   try {
+    const supabase = getSupabase();
     const { walkthroughUrl, logoUrl, maxSeconds = 30 } = req.body;
 
-    if (!walkthroughUrl || !logoUrl) {
-      return res.status(400).json({ ok: false, error: "Missing URLs" });
-    }
-
-    const { data: job, error } = await supabase
+    const { data: job } = await supabase
       .from("render_jobs")
       .insert({
         status: "queued",
@@ -146,8 +189,6 @@ app.post("/compose-walkthrough", async (req, res) => {
       })
       .select("*")
       .single();
-
-    if (error) throw error;
 
     const jobId = job.id;
 
@@ -160,7 +201,6 @@ app.post("/compose-walkthrough", async (req, res) => {
     await runFFmpeg([
       "-y",
       "-i", walkPath,
-      "-t", String(maxSeconds),
       "-vn",
       "-c:a", "aac",
       "-b:a", "128k",
@@ -177,27 +217,17 @@ app.post("/compose-walkthrough", async (req, res) => {
         upsert: true
       });
 
-    if (up.error) throw up.error;
-
     const { data: pub } =
       supabase.storage.from(BUCKET).getPublicUrl(up.data.path);
 
-    const heygenVideoId = await heygenCreateVideo({
-      audioUrl: pub.publicUrl,
-      jobId
-    });
+    const heygenVideoId = await heygenCreateVideo(pub.publicUrl, jobId);
 
     await supabase.from("render_jobs").update({
       status: "heygen_requested",
-      audio_public_url: pub.publicUrl,
       heygen_video_id: heygenVideoId
     }).eq("id", jobId);
 
-    res.json({
-      ok: true,
-      job_id: jobId,
-      heygen_video_id: heygenVideoId
-    });
+    res.json({ ok: true, job_id: jobId });
 
   } catch (err) {
     console.error(err);
@@ -205,119 +235,61 @@ app.post("/compose-walkthrough", async (req, res) => {
   }
 });
 
-/* -----------------------------
-   JOB STATUS
------------------------------ */
-
 app.get("/job/:id", async (req, res) => {
   const supabase = getSupabase();
-  const { data, error } =
+  const { data } =
     await supabase.from("render_jobs")
       .select("*")
       .eq("id", req.params.id)
       .single();
 
-  if (error) return res.status(404).json({ ok: false });
-
   res.json({ ok: true, job: data });
 });
 
-/* -----------------------------
-   HEYGEN CALLBACK
------------------------------ */
+/* ==============================
+   WEBHOOK (FAST RETURN)
+============================== */
 
 app.post("/heygen-callback", async (req, res) => {
-  const supabase = getSupabase();
-
   try {
     const token = req.query.token;
     const jobId = Number(req.query.job_id);
 
-    if (token !== mustEnv("HEYGEN_WEBHOOK_SECRET")) {
+    if (token !== process.env.HEYGEN_WEBHOOK_SECRET) {
       return res.status(401).json({ ok: false });
     }
 
     const status = req.body?.data?.status;
     const videoUrl = req.body?.data?.video_url;
 
-    console.log("HEYGEN CALLBACK:", { jobId, status });
-
     if (status !== "completed" || !videoUrl) {
       return res.json({ ok: true });
     }
+
+    const supabase = getSupabase();
 
     await supabase.from("render_jobs").update({
       status: "rendering",
       heygen_video_url: videoUrl
     }).eq("id", jobId);
 
-    // === COMPOSE VIDEO ===
+    // 🔥 Run detached
+    setImmediate(() => {
+      processRender(jobId, videoUrl).catch(console.error);
+    });
 
-    const tmp = "/tmp";
-    const job = (await supabase
-      .from("render_jobs")
-      .select("*")
-      .eq("id", jobId)
-      .single()).data;
-
-    const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
-    const avatarPath = path.join(tmp, `avatar-${jobId}.mp4`);
-    const logoPath = path.join(tmp, `logo-${jobId}.png`);
-    const finalPath = path.join(tmp, `final-${jobId}.mp4`);
-
-    await downloadToFile(job.walkthrough_url, walkPath);
-    await downloadToFile(videoUrl, avatarPath);
-    await downloadToFile(job.logo_url, logoPath);
-
-    await runFFmpeg([
-      "-y",
-      "-i", walkPath,
-      "-i", avatarPath,
-      "-filter_complex",
-      "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[vbg];" +
-      "[1:v]scale=iw*0.5:-2,chromakey=0x00FF00:0.18:0.08[fg];" +
-      "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
-      "-map", "[outv]",
-      "-map", "1:a?",
-      "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-crf", "28",
-      "-pix_fmt", "yuv420p",
-      "-c:a", "aac",
-      finalPath
-    ]);
-
-    const buffer = fs.readFileSync(finalPath);
-    const storagePath = `renders/final-${jobId}.mp4`;
-
-    const up = await supabase.storage
-      .from(BUCKET)
-      .upload(storagePath, buffer, {
-        contentType: "video/mp4",
-        upsert: true
-      });
-
-    if (up.error) throw up.error;
-
-    const { data: pub } =
-      supabase.storage.from(BUCKET).getPublicUrl(up.data.path);
-
-    await supabase.from("render_jobs").update({
-      status: "completed",
-      final_public_url: pub.publicUrl
-    }).eq("id", jobId);
-
-    res.json({ ok: true });
+    // 🔥 Immediate return (no timeout)
+    return res.json({ ok: true });
 
   } catch (err) {
-    console.error("CALLBACK ERROR:", err);
-    res.status(500).json({ ok: false, error: String(err) });
+    console.error(err);
+    return res.status(500).json({ ok: false });
   }
 });
 
-/* -----------------------------
-   SERVER
------------------------------ */
+/* ==============================
+   START SERVER
+============================== */
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
