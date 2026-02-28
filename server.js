@@ -58,7 +58,7 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN CREATE (FIXED)
+   HEYGEN CREATE (CORRECT)
 ============================== */
 
 async function heygenCreateVideo(audioUrl, jobId) {
@@ -85,7 +85,7 @@ async function heygenCreateVideo(audioUrl, jobId) {
       }
     }],
     dimension: { width: 1080, height: 1920 },
-    callback_url: callbackUrl   // ✅ THIS IS THE FIX
+    callback_url: callbackUrl
   };
 
   const resp = await fetch(
@@ -194,13 +194,15 @@ app.get("/", (req, res) => {
   res.json({ ok: true });
 });
 
+/* START JOB */
+
 app.post("/compose-walkthrough", async (req, res) => {
   try {
     const supabase = getSupabase();
     const { walkthroughUrl, logoUrl, maxSeconds = 30 } = req.body;
 
     if (!walkthroughUrl || !logoUrl) {
-      return res.status(400).json({ ok: false });
+      return res.status(400).json({ ok: false, error: "Missing URLs" });
     }
 
     const { data: job, error } = await supabase
@@ -264,9 +266,31 @@ app.post("/compose-walkthrough", async (req, res) => {
   }
 });
 
-/* ==============================
-   WEBHOOK
-============================== */
+/* JOB STATUS */
+
+app.get("/job/:id", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+
+    const { data, error } = await supabase
+      .from("render_jobs")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ ok: false, error: "Job not found" });
+    }
+
+    res.json({ ok: true, job: data });
+
+  } catch (err) {
+    console.error("JOB STATUS ERROR:", err);
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* WEBHOOK */
 
 app.post("/heygen-callback", async (req, res) => {
   try {
@@ -303,9 +327,7 @@ app.post("/heygen-callback", async (req, res) => {
   }
 });
 
-/* ==============================
-   GLOBAL SAFETY
-============================== */
+/* GLOBAL SAFETY */
 
 process.on("unhandledRejection", err => {
   console.error("UNHANDLED REJECTION:", err);
@@ -315,9 +337,7 @@ process.on("uncaughtException", err => {
   console.error("UNCAUGHT EXCEPTION:", err);
 });
 
-/* ==============================
-   START SERVER
-============================== */
+/* START SERVER */
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
