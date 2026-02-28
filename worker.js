@@ -5,34 +5,28 @@ import path from "path";
 import fetch from "node-fetch";
 
 /* ==============================
-   ENV
+   ENV + CONFIG
 ============================== */
 
 function mustEnv(name) {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing env var: ${name}`);
-  return value;
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
-function getSupabase() {
-  return createClient(
-    mustEnv("SUPABASE_URL"),
-    mustEnv("SUPABASE_SERVICE_ROLE_KEY")
-  );
-}
+const supabase = createClient(
+  mustEnv("SUPABASE_URL"),
+  mustEnv("SUPABASE_SERVICE_ROLE_KEY")
+);
 
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ==============================
-   FILE DOWNLOAD
+   UTIL: DOWNLOAD FILE
 ============================== */
 
 async function downloadToFile(url, outPath) {
-  if (!url || !url.startsWith("http")) {
-    throw new Error(`Invalid URL: ${url}`);
-  }
-
   const resp = await fetch(url);
 
   if (!resp.ok) {
@@ -49,7 +43,7 @@ async function downloadToFile(url, outPath) {
 }
 
 /* ==============================
-   FFMPEG WRAPPER
+   UTIL: RUN FFMPEG
 ============================== */
 
 function runFFmpeg(args) {
@@ -67,61 +61,51 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN CREATE (COMPATIBLE VERSION)
+   HEYGEN CREATE VIDEO
 ============================== */
 
-async function heygenCreateVideo(audioUrl, jobId) {
-
-  const callbackUrl =
-    `https://reelestate-api-9oob.onrender.com/heygen-callback` +
-    `?job_id=${jobId}` +
-    `&token=${mustEnv("HEYGEN_WEBHOOK_SECRET")}`;
-
+async function createHeygenVideo(audioUrl) {
   const resp = await fetch(
     "https://api.heygen.com/v2/video/generate",
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Api-Key": mustEnv("HEYGEN_API_KEY")
+        "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
       },
       body: JSON.stringify({
         video_inputs: [
           {
             character: {
               type: "avatar",
-              avatar_id: mustEnv("HEYGEN_AVATAR_ID")
+              avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
             },
             voice: {
               type: "audio",
-              audio_url: audioUrl
+              audio_url: audioUrl,
             },
             background: {
               type: "color",
-              value: "#00FF00"
+              value: "#00FF00",
             },
-            callback_url: callbackUrl  // 🔥 moved inside video_inputs
-          }
+          },
         ],
-        dimension: { width: 1080, height: 1920 }
-      })
+        dimension: { width: 1080, height: 1920 },
+      }),
     }
   );
 
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`HeyGen create error: ${text}`);
+    throw new Error(`HeyGen error: ${text}`);
   }
 
   const json = await resp.json();
   const videoId = json?.data?.video_id;
 
+  if (!videoId) throw new Error("No video_id returned");
+
   console.log("HEYGEN VIDEO ID:", videoId);
-
-  if (!videoId) {
-    throw new Error("HeyGen did not return video_id");
-  }
-
   return videoId;
 }
 
@@ -130,60 +114,64 @@ async function heygenCreateVideo(audioUrl, jobId) {
 ============================== */
 
 async function processQueued(job) {
-  const supabase = getSupabase();
   const jobId = job.id;
-
   console.log("Processing QUEUED:", jobId);
 
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
   const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
 
+  // Download walkthrough
   await downloadToFile(job.walkthrough_url, walkPath);
 
+  // Extract audio
   await runFFmpeg([
     "-y",
-    "-i", walkPath,
+    "-i",
+    walkPath,
     "-vn",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    audioPath
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    audioPath,
   ]);
 
+  // Upload audio
   const audioBuffer = fs.readFileSync(audioPath);
   const storagePath = `renders/audio-${jobId}.m4a`;
 
-  const upload = await supabase.storage
+  const { error } = await supabase.storage
     .from(BUCKET)
     .upload(storagePath, audioBuffer, {
       contentType: "audio/mp4",
-      upsert: true
+      upsert: true,
     });
 
-  if (upload.error) throw upload.error;
+  if (error) throw error;
 
   const { data: pub } =
     supabase.storage.from(BUCKET).getPublicUrl(storagePath);
 
-  const videoId = await heygenCreateVideo(pub.publicUrl, jobId);
+  // Send to HeyGen
+  const videoId = await createHeygenVideo(pub.publicUrl);
 
+  // Update DB
   await supabase
     .from("render_jobs")
     .update({
       status: "heygen_requested",
-      heygen_video_id: videoId
+      heygen_video_id: videoId,
     })
     .eq("id", jobId);
 }
 
 /* ==============================
-   PHASE 2 — PROCESS RENDERING
+   PHASE 2 — RENDER FINAL
 ============================== */
 
 async function processRendering(job) {
-  const supabase = getSupabase();
   const jobId = job.id;
-
   console.log("Rendering:", jobId);
 
   const tmp = "/tmp";
@@ -196,33 +184,42 @@ async function processRendering(job) {
 
   await runFFmpeg([
     "-y",
-    "-i", walkPath,
-    "-i", avatarPath,
+    "-i",
+    walkPath,
+    "-i",
+    avatarPath,
     "-filter_complex",
     "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[vbg];" +
-    "[1:v]scale=iw*0.5:-2,chromakey=0x00FF00:0.18:0.08[fg];" +
-    "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
-    "-map", "[outv]",
-    "-map", "1:a?",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "28",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    finalPath
+      "[1:v]scale=iw*0.5:-2,chromakey=0x00FF00:0.18:0.08[fg];" +
+      "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
+    "-map",
+    "[outv]",
+    "-map",
+    "1:a?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "28",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    finalPath,
   ]);
 
   const buffer = fs.readFileSync(finalPath);
   const storagePath = `renders/final-${jobId}.mp4`;
 
-  const upload = await supabase.storage
+  const { error } = await supabase.storage
     .from(BUCKET)
     .upload(storagePath, buffer, {
       contentType: "video/mp4",
-      upsert: true
+      upsert: true,
     });
 
-  if (upload.error) throw upload.error;
+  if (error) throw error;
 
   const { data: pub } =
     supabase.storage.from(BUCKET).getPublicUrl(storagePath);
@@ -231,7 +228,7 @@ async function processRendering(job) {
     .from("render_jobs")
     .update({
       status: "completed",
-      final_public_url: pub.publicUrl
+      final_public_url: pub.publicUrl,
     })
     .eq("id", jobId);
 
@@ -243,11 +240,8 @@ async function processRendering(job) {
 ============================== */
 
 async function loop() {
-  const supabase = getSupabase();
-
   while (true) {
     try {
-
       const { data: queued } = await supabase
         .from("render_jobs")
         .select("*")
@@ -268,7 +262,6 @@ async function loop() {
       if (rendering?.length) {
         await processRendering(rendering[0]);
       }
-
     } catch (err) {
       console.error("Worker error:", err);
     }
