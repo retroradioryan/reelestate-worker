@@ -48,7 +48,6 @@ function runFFmpeg(args) {
     const ff = spawn("ffmpeg", args);
 
     ff.stderr.on("data", d => console.log(d.toString()));
-
     ff.on("error", reject);
 
     ff.on("close", code => {
@@ -59,7 +58,7 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN CREATE
+   HEYGEN CREATE (FIXED)
 ============================== */
 
 async function heygenCreateVideo(audioUrl, jobId) {
@@ -67,7 +66,7 @@ async function heygenCreateVideo(audioUrl, jobId) {
   const baseUrl = mustEnv("PUBLIC_BASE_URL");
   const secret = mustEnv("HEYGEN_WEBHOOK_SECRET");
 
-  const webhookUrl =
+  const callbackUrl =
     `${baseUrl}/heygen-callback?token=${secret}&job_id=${jobId}`;
 
   const body = {
@@ -86,7 +85,7 @@ async function heygenCreateVideo(audioUrl, jobId) {
       }
     }],
     dimension: { width: 1080, height: 1920 },
-    webhook_url: webhookUrl
+    callback_url: callbackUrl   // ✅ THIS IS THE FIX
   };
 
   const resp = await fetch(
@@ -156,7 +155,6 @@ async function processRender(jobId, videoUrl) {
     ]);
 
     const buffer = fs.readFileSync(finalPath);
-
     const storagePath = `renders/final-${jobId}.mp4`;
 
     const up = await supabase.storage
@@ -263,23 +261,6 @@ app.post("/compose-walkthrough", async (req, res) => {
   } catch (err) {
     console.error("START ERROR:", err);
     res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-app.get("/job/:id", async (req, res) => {
-  try {
-    const supabase = getSupabase();
-    const { data, error } =
-      await supabase.from("render_jobs")
-        .select("*")
-        .eq("id", req.params.id)
-        .single();
-
-    if (error) throw error;
-
-    res.json({ ok: true, job: data });
-  } catch {
-    res.status(404).json({ ok: false });
   }
 });
 
