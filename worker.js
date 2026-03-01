@@ -2,7 +2,6 @@ import { createClient } from "@supabase/supabase-js";
 import { spawn } from "child_process";
 import OpenAI from "openai";
 import fs from "fs";
-import path from "path";
 
 /* ==============================
    ENV VALIDATION
@@ -90,9 +89,8 @@ async function extractAudio(videoPath, audioPath) {
 }
 
 async function generateAvatarScript(walkthroughUrl, jobId) {
-  const tmp = "/tmp";
-  const videoPath = `${tmp}/walk-${jobId}.mp4`;
-  const audioPath = `${tmp}/audio-${jobId}.mp3`;
+  const videoPath = `/tmp/walk-${jobId}.mp4`;
+  const audioPath = `/tmp/audio-${jobId}.mp3`;
 
   await downloadFile(walkthroughUrl, videoPath);
   await extractAudio(videoPath, audioPath);
@@ -104,7 +102,7 @@ async function generateAvatarScript(walkthroughUrl, jobId) {
     model: "whisper-1",
   });
 
-  console.log("✍️ Generating summary script...");
+  console.log("✍️ Generating agent script...");
 
   const summary = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -112,7 +110,7 @@ async function generateAvatarScript(walkthroughUrl, jobId) {
       {
         role: "system",
         content:
-          "Summarise this property walkthrough into a confident 20-second professional real estate script spoken by an agent."
+          "Summarise this property walkthrough into a confident, polished 20-second real estate script spoken by a professional agent."
       },
       {
         role: "user",
@@ -132,11 +130,20 @@ async function createHeygenVideo({ scriptText, jobId }) {
   const callbackUrl =
     `${HEYGEN_CALLBACK_BASE_URL}?token=${encodeURIComponent(HEYGEN_WEBHOOK_SECRET)}&job_id=${encodeURIComponent(jobId)}`;
 
+  console.log("🎬 Creating HeyGen video:", jobId);
+
   const payload = {
     video_inputs: [
       {
-        character: { type: "avatar", avatar_id: HEYGEN_AVATAR_ID },
-        voice: { type: "text", voice_id: HEYGEN_VOICE_ID, input_text: scriptText },
+        character: {
+          type: "avatar",
+          avatar_id: HEYGEN_AVATAR_ID,
+        },
+        voice: {
+          type: "text",
+          voice_id: HEYGEN_VOICE_ID,
+          input_text: scriptText,
+        },
         background: { type: "color", value: "#00FF00" },
       },
     ],
@@ -154,7 +161,9 @@ async function createHeygenVideo({ scriptText, jobId }) {
   });
 
   const json = await resp.json();
-  return json?.data?.video_id;
+  if (!json?.data?.video_id) throw new Error("HeyGen video_id missing");
+
+  return json.data.video_id;
 }
 
 /* ==============================
@@ -193,7 +202,7 @@ async function processQueued(job) {
 }
 
 /* ==============================
-   PROCESS RENDERING (COMPOSITE)
+   PROCESS RENDERING
 ============================== */
 
 async function processRendering(job) {
@@ -211,10 +220,9 @@ async function processRendering(job) {
 
   console.log("🎬 Compositing final video:", jobId);
 
-  const tmp = "/tmp";
-  const walkPath = `${tmp}/walk-${jobId}.mp4`;
-  const avatarPath = `${tmp}/avatar-${jobId}.mp4`;
-  const finalPath = `${tmp}/final-${jobId}.mp4`;
+  const walkPath = `/tmp/walk-${jobId}.mp4`;
+  const avatarPath = `/tmp/avatar-${jobId}.mp4`;
+  const finalPath = `/tmp/final-${jobId}.mp4`;
 
   await downloadFile(locked.walkthrough_url, walkPath);
   await downloadFile(locked.heygen_video_url, avatarPath);
@@ -222,11 +230,14 @@ async function processRendering(job) {
   const filter =
     `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
     `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,` +
-    `drawbox=x=0:y=1650:w=1080:h=200:color=black@0.6:t=fill,` +
+    `drawbox=x=0:y=1650:w=1080:h=220:color=black@0.55:t=fill,` +
     `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:` +
-    `text='Luxury Family Home':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=1700[vbg];` +
-    `[1:v]scale=520:-2,colorkey=0x00FF00:0.35:0.2[av];` +
-    `[vbg][av]overlay=W-w-80:H-h-420[outv]`;
+    `text='Brand New Listing':fontcolor=white:fontsize=64:x=(w-text_w)/2:y=1710[vbg];` +
+    `[1:v]scale=520:-2,` +
+    `colorkey=0x00FF00:0.32:0.15,` +
+    `format=rgba,` +
+    `colorchannelmixer=aa=0.92[av];` +
+    `[vbg][av]overlay=W-w-80:H-h-180[outv]`;
 
   await runFFmpeg([
     "-y",
@@ -246,8 +257,10 @@ async function processRendering(job) {
     finalPath,
   ]);
 
-  const storagePath = `renders/final-${jobId}.mp4`;
-  const publicUrl = await uploadToStorage(finalPath, storagePath);
+  const publicUrl = await uploadToStorage(
+    finalPath,
+    `renders/final-${jobId}.mp4`
+  );
 
   await supabase
     .from("render_jobs")
