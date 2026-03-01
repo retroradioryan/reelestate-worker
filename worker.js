@@ -1,10 +1,4 @@
-// worker.js (FULL REWRITE — Node 22 SAFE + Lower-Third System)
-// Implements:
-// ✅ Avatar size/position: width 450–480 (default 460), right margin 60, bottom margin 180
-// ✅ Branded lower-third (PNG) overlay at x=60, y=1520 (1080x1920 canvas)
-// ✅ Optional lower-third slide-in animation (0.4s) via FFmpeg expression
-// ✅ Mobile-safe vertical scaling: scale=decrease + pad (no crop/stretch)
-// ✅ Production hardening: job locking, basic idempotency, temp cleanup, safer downloads, better ffmpeg mapping
+// worker.js (Node 22 SAFE + Lower-Third System + DEBUG CALLBACK URL)
 //
 // Pipeline:
 // queued -> processing -> heygen_requested -> (webhook sets rendering + heygen_video_url) -> rendering_in_progress -> completed
@@ -25,42 +19,42 @@ function mustEnv(name) {
   return v;
 }
 
+// Supabase
 const supabase = createClient(
   mustEnv("SUPABASE_URL"),
   mustEnv("SUPABASE_SERVICE_ROLE_KEY")
 );
 
+// OpenAI
 const openai = new OpenAI({ apiKey: mustEnv("OPENAI_API_KEY") });
 
+// Storage / polling
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 const POLL_MS = Number(process.env.POLL_MS || 5000);
 
 // ---- KEYING ----
-const KEY_COLOR_HEX = process.env.KEY_COLOR_HEX || "#00FF00"; // HeyGen background
-const KEY_COLOR_FFMPEG = (process.env.KEY_COLOR_FFMPEG || "0x00FF00").trim(); // 0xRRGGBB
+const KEY_COLOR_HEX = process.env.KEY_COLOR_HEX || "#00FF00";
+const KEY_COLOR_FFMPEG = (process.env.KEY_COLOR_FFMPEG || "0x00FF00").trim();
 const KEY_SIMILARITY = String(process.env.KEY_SIMILARITY || "0.35");
 const KEY_BLEND = String(process.env.KEY_BLEND || "0.20");
 
 // ---- AVATAR OVERLAY (BOTTOM RIGHT) ----
-const AVATAR_SCALE_W = Number(process.env.AVATAR_SCALE_W || 460); // 450–480 sweet spot; default 460
-const AVATAR_MARGIN_X = Number(process.env.AVATAR_MARGIN_X || 60); // distance from RIGHT edge
-const AVATAR_MARGIN_Y = Number(process.env.AVATAR_MARGIN_Y || 180); // distance from BOTTOM edge
+const AVATAR_SCALE_W = Number(process.env.AVATAR_SCALE_W || 460);
+const AVATAR_MARGIN_X = Number(process.env.AVATAR_MARGIN_X || 60);
+const AVATAR_MARGIN_Y = Number(process.env.AVATAR_MARGIN_Y || 180);
 
-// ---- LOWER THIRD (BRANDED) ----
-// Default placement tuned for 1080x1920
+// ---- LOWER THIRD ----
 const LT_X = Number(process.env.LT_X || 60);
 const LT_Y = Number(process.env.LT_Y || 1520);
 const LT_W = Number(process.env.LT_W || 780);
 const LT_H = Number(process.env.LT_H || 180);
 const LT_RADIUS = Number(process.env.LT_RADIUS || 24);
 
-// Brand styling (tweak to match ReelEstate)
-const BRAND_BG = process.env.BRAND_BG || "#0E1A2B"; // dark navy
-const BRAND_ACCENT = process.env.BRAND_ACCENT || "#2D8CFF"; // electric blue
+const BRAND_BG = process.env.BRAND_BG || "#0E1A2B";
+const BRAND_ACCENT = process.env.BRAND_ACCENT || "#2D8CFF";
 const BRAND_TEXT = process.env.BRAND_TEXT || "#FFFFFF";
 const BRAND_TEXT_SUB = process.env.BRAND_TEXT_SUB || "rgba(255,255,255,0.88)";
 
-// Optional: slide-in animation for lower third
 const LT_ANIMATE = String(process.env.LT_ANIMATE || "true").toLowerCase() === "true";
 const LT_ANIM_SECONDS = Number(process.env.LT_ANIM_SECONDS || 0.4);
 
@@ -71,10 +65,23 @@ const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 120000);
 const FETCH_RETRIES = Number(process.env.FETCH_RETRIES || 3);
 
 // ---- HEYGEN ----
+// IMPORTANT: Render env key is HEYGEN_API_KEY (NOT HEYGEN_API_KEY)
+const HEYGEN_API_KEY = mustEnv("HEYGEN_API_KEY");
 const HEYGEN_CALLBACK_BASE_URL = mustEnv("HEYGEN_CALLBACK_BASE_URL");
 const HEYGEN_WEBHOOK_SECRET = mustEnv("HEYGEN_WEBHOOK_SECRET");
+const HEYGEN_AVATAR_ID = mustEnv("HEYGEN_AVATAR_ID");
+const HEYGEN_VOICE_ID = mustEnv("HEYGEN_VOICE_ID");
 
 console.log("🚀 WORKER LIVE (transcribe → rewrite → HeyGen → branded composite)");
+console.log("---- ENV CHECK ----");
+console.log("SUPABASE_URL present?", !!process.env.SUPABASE_URL);
+console.log("OPENAI_API_KEY present?", !!process.env.OPENAI_API_KEY);
+console.log("HEYGEN_API_KEY present?", !!process.env.HEYGEN_API_KEY);
+console.log("HEYGEN_CALLBACK_BASE_URL:", HEYGEN_CALLBACK_BASE_URL);
+console.log("HEYGEN_WEBHOOK_SECRET present?", !!process.env.HEYGEN_WEBHOOK_SECRET);
+console.log("HEYGEN_AVATAR_ID present?", !!process.env.HEYGEN_AVATAR_ID);
+console.log("HEYGEN_VOICE_ID present?", !!process.env.HEYGEN_VOICE_ID);
+console.log("-------------------");
 
 /* ==============================
    UTIL: SLEEP
@@ -109,7 +116,7 @@ async function fetchRetry(url, opts = {}, retries = FETCH_RETRIES) {
 }
 
 /* ==============================
-   UTIL: DOWNLOAD FILE (Node 22 streaming)
+   UTIL: DOWNLOAD FILE
 ============================== */
 async function downloadToFile(url, outPath, { maxMB } = {}) {
   if (!url || !url.startsWith("http")) throw new Error(`Invalid URL: ${url}`);
@@ -120,7 +127,6 @@ async function downloadToFile(url, outPath, { maxMB } = {}) {
     throw new Error(`Download failed: ${resp.status} ${text}`);
   }
 
-  // Prefer streaming
   if (!resp.body || typeof resp.body.getReader !== "function") {
     const ab = await resp.arrayBuffer();
     const buf = Buffer.from(ab);
@@ -151,7 +157,7 @@ async function downloadToFile(url, outPath, { maxMB } = {}) {
 }
 
 /* ==============================
-   UTIL: SAFE TEMP CLEANUP
+   UTIL: CLEANUP
 ============================== */
 function safeUnlink(p) {
   try {
@@ -165,7 +171,6 @@ function safeUnlink(p) {
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", args);
-
     ff.stderr.on("data", (d) => console.log(d.toString()));
     ff.on("error", reject);
     ff.on("close", (code) => {
@@ -176,20 +181,9 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   UTIL: RUN FFCREATE (lower-third image)
-   Uses ffmpeg lavfi to draw a rounded-ish bar + accent + text.
-   Note: FFmpeg doesn't have perfect rounded rectangles natively.
-   We fake "premium" corners by drawing slightly inset rectangles.
-   This is clean enough for V1, and keeps dependencies at zero.
+   LOWER THIRD PNG
 ============================== */
-async function generateLowerThirdPng({
-  outPath,
-  headline,
-  subline,
-  tagLine,
-  logoPath, // optional future use (not required)
-}) {
-  // sanitize text for ffmpeg drawtext
+async function generateLowerThirdPng({ outPath, headline, subline, tagLine }) {
   const esc = (s) =>
     String(s || "")
       .replace(/\\/g, "\\\\")
@@ -201,29 +195,16 @@ async function generateLowerThirdPng({
   const h2 = esc(subline || "Just listed • Book a viewing today");
   const h3 = esc(tagLine || "");
 
-  // Layout within lower-third
-  const padL = 26; // inner padding
+  const padL = 26;
   const accentW = 8;
   const accentGap = 18;
 
-  // Font: try common fonts in Linux images; DejaVu is usually present
   const font = process.env.LT_FONTFILE || "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-
-  // We'll build a transparent 780x180 PNG:
-  // - Base: transparent
-  // - Draw background rectangle (solid, high opacity)
-  // - Draw accent strip
-  // - Draw headline and subline and optional tag line
-
-  // “Rounded-ish” trick:
-  // draw main rect inset by 2px, then a second rect inset by 4px
-  // This softens corners visually even without true rounding.
 
   const bg1 = `drawbox=x=0:y=0:w=${LT_W}:h=${LT_H}:color=${BRAND_BG}@0.92:t=fill`;
   const bg2 = `drawbox=x=2:y=2:w=${LT_W - 4}:h=${LT_H - 4}:color=${BRAND_BG}@0.92:t=fill`;
   const accent = `drawbox=x=0:y=0:w=${accentW}:h=${LT_H}:color=${BRAND_ACCENT}@1.0:t=fill`;
 
-  // Typography sizes tuned for mobile readability
   const headSize = Number(process.env.LT_HEAD_SIZE || 52);
   const subSize = Number(process.env.LT_SUB_SIZE || 40);
   const tagSize = Number(process.env.LT_TAG_SIZE || 36);
@@ -233,9 +214,8 @@ async function generateLowerThirdPng({
   const subY = 92;
   const tagY = 132;
 
-  // Using drawtext with fontfile
-  const dt1 = `drawtext=fontfile='${font}':text='${h1}':x=${textX}:y=${headY}:fontsize=${headSize}:fontcolor=${BRAND_TEXT}:fontcolor_expr=${BRAND_TEXT}:line_spacing=8:shadowcolor=black@0:shadowx=0:shadowy=0`;
-  const dt2 = `drawtext=fontfile='${font}':text='${h2}':x=${textX}:y=${subY}:fontsize=${subSize}:fontcolor=${BRAND_TEXT_SUB}:line_spacing=6:shadowcolor=black@0:shadowx=0:shadowy=0`;
+  const dt1 = `drawtext=fontfile='${font}':text='${h1}':x=${textX}:y=${headY}:fontsize=${headSize}:fontcolor=${BRAND_TEXT}:shadowcolor=black@0:shadowx=0:shadowy=0`;
+  const dt2 = `drawtext=fontfile='${font}':text='${h2}':x=${textX}:y=${subY}:fontsize=${subSize}:fontcolor=${BRAND_TEXT_SUB}:shadowcolor=black@0:shadowx=0:shadowy=0`;
 
   const filters = [bg1, bg2, accent, dt1, dt2];
 
@@ -245,8 +225,6 @@ async function generateLowerThirdPng({
     );
   }
 
-  const filter = filters.join(",");
-
   await runFFmpeg([
     "-y",
     "-f",
@@ -254,7 +232,7 @@ async function generateLowerThirdPng({
     "-i",
     `color=c=black@0.0:s=${LT_W}x${LT_H}:r=30`,
     "-vf",
-    filter,
+    filters.join(","),
     "-frames:v",
     "1",
     outPath,
@@ -262,7 +240,7 @@ async function generateLowerThirdPng({
 }
 
 /* ==============================
-   STEP: EXTRACT AUDIO
+   AUDIO EXTRACT
 ============================== */
 async function extractAudioMp4ToM4a(videoPath, audioOutPath) {
   await runFFmpeg([
@@ -283,11 +261,10 @@ async function extractAudioMp4ToM4a(videoPath, audioOutPath) {
 }
 
 /* ==============================
-   STEP: TRANSCRIBE (Whisper)
+   WHISPER TRANSCRIBE
 ============================== */
 async function transcribeAudio(audioPath) {
   console.log("📝 Transcribing walkthrough audio…");
-
   const result = await openai.audio.transcriptions.create({
     model: "whisper-1",
     file: fs.createReadStream(audioPath),
@@ -299,7 +276,7 @@ async function transcribeAudio(audioPath) {
 }
 
 /* ==============================
-   STEP: REWRITE SCRIPT
+   SCRIPT REWRITE
 ============================== */
 function targetWordsForSeconds(maxSeconds) {
   const wps = 2.4;
@@ -308,7 +285,6 @@ function targetWordsForSeconds(maxSeconds) {
 
 async function rewriteToPresenterScript(transcript, maxSeconds = 30) {
   const targetWords = targetWordsForSeconds(maxSeconds);
-
   console.log(`✍️ Rewriting transcript → presenter script (~${maxSeconds}s, ~${targetWords} words)…`);
 
   const resp = await openai.chat.completions.create({
@@ -336,21 +312,27 @@ async function rewriteToPresenterScript(transcript, maxSeconds = 30) {
 }
 
 /* ==============================
-   STEP: HEYGEN CREATE (TEXT VOICE)
+   HEYGEN CREATE
 ============================== */
 async function createHeygenVideoFromText({ scriptText, jobId }) {
   console.log("🎤 Sending TEXT script to HeyGen:\n" + scriptText);
 
-  const callbackUrl =
-    `${HEYGEN_CALLBACK_BASE_URL}` +
-    `?token=${encodeURIComponent(HEYGEN_WEBHOOK_SECRET)}` +
-    `&job_id=${encodeURIComponent(jobId)}`;
+  // Build the callback URL *and log it*
+  const callbackUrl = `${HEYGEN_CALLBACK_BASE_URL}?token=${encodeURIComponent(
+    HEYGEN_WEBHOOK_SECRET
+  )}&job_id=${encodeURIComponent(jobId)}`;
+
+  console.log("---- HEYGEN CALLBACK DEBUG ----");
+  console.log("Callback URL being sent to HeyGen:");
+  console.log(callbackUrl);
+  console.log("Secret present?", !!HEYGEN_WEBHOOK_SECRET);
+  console.log("--------------------------------");
 
   const payload = {
     video_inputs: [
       {
-        character: { type: "avatar", avatar_id: mustEnv("HEYGEN_AVATAR_ID") },
-        voice: { type: "text", voice_id: mustEnv("HEYGEN_VOICE_ID"), input_text: scriptText.trim() },
+        character: { type: "avatar", avatar_id: HEYGEN_AVATAR_ID },
+        voice: { type: "text", voice_id: HEYGEN_VOICE_ID, input_text: scriptText.trim() },
         background: { type: "color", value: KEY_COLOR_HEX },
         callback_url: callbackUrl,
       },
@@ -362,13 +344,16 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
+      "X-Api-Key": HEYGEN_API_KEY,
     },
     body: JSON.stringify(payload),
   });
 
   const bodyText = await resp.text().catch(() => "");
-  if (!resp.ok) throw new Error(`HeyGen error: ${bodyText}`);
+  if (!resp.ok) {
+    console.error("❌ HeyGen generate failed:", resp.status, bodyText?.slice(0, 400));
+    throw new Error(`HeyGen error: ${bodyText}`);
+  }
 
   const json = JSON.parse(bodyText);
   const videoId = json?.data?.video_id;
@@ -379,7 +364,7 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
 }
 
 /* ==============================
-   STEP: UPLOAD FILE TO SUPABASE
+   UPLOAD TO SUPABASE
 ============================== */
 async function uploadToSupabase({ localPath, storagePath, contentType }) {
   const buf = fs.readFileSync(localPath);
@@ -411,10 +396,7 @@ async function failJob(jobId, err) {
   const msg = String(err?.message || err || "Unknown error");
   console.error("❌ Job failed:", jobId, msg);
 
-  await supabase
-    .from("render_jobs")
-    .update({ status: "failed", error: msg.slice(0, 2000) })
-    .eq("id", jobId);
+  await supabase.from("render_jobs").update({ status: "failed", error: msg.slice(0, 2000) }).eq("id", jobId);
 }
 
 /* ==============================
@@ -426,7 +408,6 @@ async function processQueued(job) {
 
   console.log("📦 Processing QUEUED:", jobId);
 
-  // lock: queued -> processing
   const lock = await supabase
     .from("render_jobs")
     .update({ status: "processing" })
@@ -446,29 +427,21 @@ async function processQueued(job) {
   const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
 
   try {
-    // 1) download walkthrough
     await downloadToFile(job.walkthrough_url, walkPath, { maxMB: MAX_WALK_DOWNLOAD_MB });
-
-    // 2) extract audio
     await extractAudioMp4ToM4a(walkPath, audioPath);
 
-    // 3) transcribe
     const transcript = await transcribeAudio(audioPath);
-
-    // 4) rewrite
     const scriptText = await rewriteToPresenterScript(transcript, maxSeconds);
 
-    // 5) create HeyGen green-screen avatar
     const heygenVideoId = await createHeygenVideoFromText({ scriptText, jobId });
 
-    // 6) update job (optional transcript/script columns)
     await updateJobSafe(
       jobId,
       {
         status: "heygen_requested",
         heygen_video_id: heygenVideoId,
-        transcript_text: transcript, // optional column
-        script_text: scriptText, // optional column
+        transcript_text: transcript,
+        script_text: scriptText,
       },
       {
         status: "heygen_requested",
@@ -478,25 +451,20 @@ async function processQueued(job) {
 
     console.log("📡 HeyGen requested. Waiting for webhook to set status=rendering…");
   } finally {
-    // Clean up temp files from Phase 1
     safeUnlink(walkPath);
     safeUnlink(audioPath);
   }
 }
 
 /* ==============================
-   LOWER-THIRD CONTENT BUILDER
-   Pull from DB columns if you have them; otherwise fallback.
-   (You can add these columns later without breaking worker)
+   LOWER THIRD COPY
 ============================== */
 function buildLowerThirdCopy(job) {
-  // You can populate these in your API service when job is created:
-  // job.agent_name, job.property_location, job.price, job.tagline etc.
   const agent = (job.agent_name || job.presenter_name || "ReelEstate AI").trim();
   const loc = (job.property_location || job.location || "New Listing").trim();
   const price = (job.price || job.list_price || "").toString().trim();
 
-  const headline = agent.toUpperCase(); // bold, confident
+  const headline = agent.toUpperCase();
   const subline = price ? `${loc} — ${price}` : `${loc}`;
   const tagLine = (job.badge || job.tagline || "Just Listed").trim();
 
@@ -514,15 +482,8 @@ async function processRendering(job) {
     return;
   }
 
-  // Idempotency guard: if already completed with URL, skip
-  if (job.status === "completed" && job.final_public_url) {
-    console.log("✅ Already completed, skipping:", jobId);
-    return;
-  }
-
   console.log("🎬 Rendering FINAL (branded):", jobId);
 
-  // lock: rendering -> rendering_in_progress
   const lock = await supabase
     .from("render_jobs")
     .update({ status: "rendering_in_progress" })
@@ -537,7 +498,6 @@ async function processRendering(job) {
     return;
   }
 
-  // Use locked row (fresh)
   const lockedJob = lock.data;
 
   const tmp = "/tmp";
@@ -547,46 +507,22 @@ async function processRendering(job) {
   const finalPath = path.join(tmp, `final-${jobId}.mp4`);
 
   try {
-    // downloads
     await downloadToFile(lockedJob.walkthrough_url, walkPath, { maxMB: MAX_WALK_DOWNLOAD_MB });
     await downloadToFile(lockedJob.heygen_video_url, avatarPath, { maxMB: MAX_AVATAR_DOWNLOAD_MB });
 
-    // create lower-third PNG
     const { headline, subline, tagLine } = buildLowerThirdCopy(lockedJob);
-    await generateLowerThirdPng({
-      outPath: lowerThirdPath,
-      headline,
-      subline,
-      tagLine,
-    });
+    await generateLowerThirdPng({ outPath: lowerThirdPath, headline, subline, tagLine });
 
-    // ---- Video Composition ----
-    // 1) Background: scale-to-fit (decrease) + pad to 1080x1920 (mobile-safe, no crop/stretch)
-    // 2) Lower-third: overlay at x=60, y=1520 (optional slide-in)
-    // 3) Avatar: colorkey green + scale 460 wide, bottom-right with margins 60/180
-    //
-    // Notes:
-    // - We map HeyGen audio if present (1:a?) because avatar is input #2 in this pipeline (index 2), but audio comes from avatar file.
-    // - Inputs: 0=walk, 1=lowerthird.png, 2=avatar.mp4
-    //
-    // Lower-third animation:
-    // x = if(t < 0.4) -w + t * speed else LT_X
-    // speed tuned so it arrives at ~LT_X at t=0.4
     const ltXExpr = LT_ANIMATE
       ? `if(lt(t\\,${LT_ANIM_SECONDS}), -w + t*${Math.ceil((LT_X + LT_W) / LT_ANIM_SECONDS)}, ${LT_X})`
       : `${LT_X}`;
 
     const filter =
-      // bg normalize
       `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
       `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[vbg];` +
-      // lower third (png already correct size)
       `[1:v]format=rgba[lt];` +
       `[vbg][lt]overlay=x='${ltXExpr}':y=${LT_Y}[v1];` +
-      // avatar key + scale
-      `[2:v]scale=${AVATAR_SCALE_W}:-2,` +
-      `colorkey=${KEY_COLOR_FFMPEG}:${KEY_SIMILARITY}:${KEY_BLEND}[av];` +
-      // avatar overlay bottom right
+      `[2:v]scale=${AVATAR_SCALE_W}:-2,colorkey=${KEY_COLOR_FFMPEG}:${KEY_SIMILARITY}:${KEY_BLEND}[av];` +
       `[v1][av]overlay=x=W-w-${AVATAR_MARGIN_X}:y=H-h-${AVATAR_MARGIN_Y}[outv]`;
 
     await runFFmpeg([
@@ -602,7 +538,7 @@ async function processRendering(job) {
       "-map",
       "[outv]",
       "-map",
-      "2:a?", // HeyGen audio if present
+      "2:a?",
       "-c:v",
       "libx264",
       "-preset",
@@ -629,17 +565,13 @@ async function processRendering(job) {
 
     const upd = await supabase
       .from("render_jobs")
-      .update({
-        status: "completed",
-        final_public_url: finalPublicUrl,
-      })
+      .update({ status: "completed", final_public_url: finalPublicUrl })
       .eq("id", jobId);
 
     if (upd.error) throw upd.error;
 
     console.log("✅ Completed:", jobId, finalPublicUrl);
   } finally {
-    // cleanup always
     safeUnlink(walkPath);
     safeUnlink(avatarPath);
     safeUnlink(lowerThirdPath);
@@ -653,7 +585,6 @@ async function processRendering(job) {
 async function loop() {
   while (true) {
     try {
-      // 1) queued job
       const { data: queued, error: qErr } = await supabase
         .from("render_jobs")
         .select("*")
@@ -674,7 +605,6 @@ async function loop() {
         continue;
       }
 
-      // 2) rendering job (set by webhook)
       const { data: rendering, error: rErr } = await supabase
         .from("render_jobs")
         .select("*")
