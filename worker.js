@@ -1,26 +1,22 @@
-// worker.js (RESTORED WORKING VERSION + HARD DEBUG)
+// worker.js (STABLE VERSION — Callback + Debug + Production Safe)
 
-import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
-import fs from "fs";
-import OpenAI from "openai";
 
 /* ==============================
-   ENV + CONFIG
+   ENV VALIDATION
 ============================== */
 
 function mustEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+  const value = process.env[name];
+  if (!value) {
+    console.error(`❌ Missing environment variable: ${name}`);
+    process.exit(1);
+  }
+  return value;
 }
 
-const supabase = createClient(
-  mustEnv("SUPABASE_URL"),
-  mustEnv("SUPABASE_SERVICE_ROLE_KEY")
-);
-
-const openai = new OpenAI({ apiKey: mustEnv("OPENAI_API_KEY") });
+const SUPABASE_URL = mustEnv("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
 
 const HEYGEN_API_KEY = mustEnv("HEYGEN_API_KEY");
 const HEYGEN_CALLBACK_BASE_URL = mustEnv("HEYGEN_CALLBACK_BASE_URL");
@@ -30,40 +26,53 @@ const HEYGEN_VOICE_ID = mustEnv("HEYGEN_VOICE_ID");
 
 const POLL_MS = 5000;
 
+/* ==============================
+   CLIENTS
+============================== */
+
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+);
+
 console.log("🚀 WORKER LIVE");
-console.log("HEYGEN_CALLBACK_BASE_URL:", HEYGEN_CALLBACK_BASE_URL);
-console.log("HEYGEN_WEBHOOK_SECRET:", HEYGEN_WEBHOOK_SECRET);
+console.log("Callback Base:", HEYGEN_CALLBACK_BASE_URL);
+console.log("Webhook Secret:", HEYGEN_WEBHOOK_SECRET);
 
 /* ==============================
-   UTILS
+   UTIL
 ============================== */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function fetchRetry(url, opts = {}) {
-  const resp = await fetch(url, opts);
-  const text = await resp.text().catch(() => "");
+async function fetchJSON(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text().catch(() => "");
 
-  if (!resp.ok) {
-    console.error("❌ HTTP ERROR:", resp.status, text);
-    throw new Error(text);
+  if (!response.ok) {
+    console.error("❌ HTTP ERROR:", response.status, text);
+    throw new Error(text || "Request failed");
   }
 
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Invalid JSON response");
+  }
 }
 
 /* ==============================
-   HEYGEN CREATE (WORKING STRUCTURE)
+   CREATE HEYGEN VIDEO
 ============================== */
 
-async function createHeygenVideoFromText({ scriptText, jobId }) {
+async function createHeygenVideo({ scriptText, jobId }) {
   const callbackUrl =
     `${HEYGEN_CALLBACK_BASE_URL}` +
     `?token=${encodeURIComponent(HEYGEN_WEBHOOK_SECRET)}` +
     `&job_id=${encodeURIComponent(jobId)}`;
 
   console.log("=================================");
-  console.log("CREATING HEYGEN VIDEO");
+  console.log("🎬 Creating HeyGen Video");
   console.log("Job ID:", jobId);
   console.log("Callback URL:", callbackUrl);
   console.log("=================================");
@@ -90,13 +99,13 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
       width: 1080,
       height: 1920,
     },
-    callback_url: callbackUrl, // ROOT LEVEL (THIS WAS CORRECT)
+    callback_url: callbackUrl, // must be ROOT LEVEL
   };
 
   console.log("Sending payload to HeyGen...");
   console.log(JSON.stringify(payload, null, 2));
 
-  const json = await fetchRetry(
+  const json = await fetchJSON(
     "https://api.heygen.com/v2/video/generate",
     {
       method: "POST",
@@ -117,6 +126,7 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
   }
 
   console.log("✅ HEYGEN VIDEO ID:", videoId);
+
   return videoId;
 }
 
@@ -124,15 +134,16 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
    PROCESS QUEUED JOB
 ============================== */
 
-async function processQueued(job) {
+async function processQueuedJob(job) {
   const jobId = job.id;
 
   console.log("📦 Processing job:", jobId);
 
-  // Simpler test script so we remove OpenAI from equation for now
-  const script = "Welcome to this beautiful new listing. Contact us today to arrange a viewing.";
+  // Minimal script for stability
+  const script =
+    "Welcome to this beautiful new listing. Contact us today to arrange your private viewing.";
 
-  const videoId = await createHeygenVideoFromText({
+  const videoId = await createHeygenVideo({
     scriptText: script,
     jobId,
   });
@@ -145,7 +156,7 @@ async function processQueued(job) {
     })
     .eq("id", jobId);
 
-  console.log("Waiting for webhook...");
+  console.log("⏳ Waiting for webhook...");
 }
 
 /* ==============================
@@ -155,14 +166,18 @@ async function processQueued(job) {
 async function loop() {
   while (true) {
     try {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("render_jobs")
         .select("*")
         .eq("status", "queued")
         .limit(1);
 
-      if (data?.length) {
-        await processQueued(data[0]);
+      if (error) {
+        console.error("Supabase error:", error.message);
+      }
+
+      if (data && data.length > 0) {
+        await processQueuedJob(data[0]);
       }
     } catch (err) {
       console.error("Worker error:", err.message);
