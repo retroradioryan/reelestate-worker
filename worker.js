@@ -22,7 +22,7 @@ const supabase = createClient(
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-console.log("🔥 WORKER VERSION 100% CLEAN 🔥");
+console.log("🚀 WORKER LIVE");
 
 /* ==============================
    DOWNLOAD FILE
@@ -30,6 +30,7 @@ console.log("🔥 WORKER VERSION 100% CLEAN 🔥");
 
 async function downloadToFile(url, outPath) {
   const resp = await fetch(url);
+
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`Download failed: ${resp.status} ${text}`);
@@ -66,42 +67,39 @@ function runFFmpeg(args) {
 ============================== */
 
 async function createHeygenVideo(scriptText) {
-  console.log("Sending script to HeyGen:");
+  console.log("🎤 Sending script to HeyGen...");
   console.log(scriptText);
 
-  const resp = await fetch(
-    "https://api.heygen.com/v2/video/generate",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
-      },
-      body: JSON.stringify({
-        video_inputs: [
-          {
-            character: {
-              type: "avatar",
-              avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
-            },
-            voice: {
-              type: "text",
-              voice_id: mustEnv("HEYGEN_VOICE_ID"),
-              input_text: scriptText.trim(),
-            },
-            background: {
-              type: "color",
-              value: "#00FF00",
-            },
+  const resp = await fetch("https://api.heygen.com/v2/video/generate", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
+    },
+    body: JSON.stringify({
+      video_inputs: [
+        {
+          character: {
+            type: "avatar",
+            avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
           },
-        ],
-        dimension: {
-          width: 1080,
-          height: 1920,
+          voice: {
+            type: "text",
+            voice_id: mustEnv("HEYGEN_VOICE_ID"),
+            input_text: scriptText.trim(),
+          },
+          background: {
+            type: "color",
+            value: "#00FF00",
+          },
         },
-      }),
-    }
-  );
+      ],
+      dimension: {
+        width: 1080,
+        height: 1920,
+      },
+    }),
+  });
 
   const body = await resp.text();
 
@@ -114,7 +112,7 @@ async function createHeygenVideo(scriptText) {
 
   if (!videoId) throw new Error("No video_id returned");
 
-  console.log("HEYGEN VIDEO ID:", videoId);
+  console.log("✅ HEYGEN VIDEO ID:", videoId);
   return videoId;
 }
 
@@ -124,7 +122,7 @@ async function createHeygenVideo(scriptText) {
 
 async function processQueued(job) {
   const jobId = job.id;
-  console.log("Processing QUEUED:", jobId);
+  console.log("📦 Processing QUEUED:", jobId);
 
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
@@ -148,6 +146,8 @@ Book your private viewing today.
       heygen_video_id: videoId,
     })
     .eq("id", jobId);
+
+  console.log("📡 Waiting for HeyGen webhook...");
 }
 
 /* ==============================
@@ -156,7 +156,7 @@ Book your private viewing today.
 
 async function processRendering(job) {
   const jobId = job.id;
-  console.log("Rendering FINAL:", jobId);
+  console.log("🎬 Rendering FINAL:", jobId);
 
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
@@ -168,28 +168,19 @@ async function processRendering(job) {
 
   await runFFmpeg([
     "-y",
-    "-i",
-    walkPath,
-    "-i",
-    avatarPath,
+    "-i", walkPath,
+    "-i", avatarPath,
     "-filter_complex",
     "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[vbg];" +
-      "[1:v]scale=iw*0.5:-2,chromakey=0x00FF00:0.18:0.08[fg];" +
-      "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
-    "-map",
-    "[outv]",
-    "-map",
-    "1:a",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "ultrafast",
-    "-crf",
-    "28",
-    "-pix_fmt",
-    "yuv420p",
-    "-c:a",
-    "aac",
+    "[1:v]scale=540:-2,colorkey=0x00FF00:0.35:0.2[fg];" +
+    "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
+    "-map", "[outv]",
+    "-map", "1:a",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "28",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
     finalPath,
   ]);
 
@@ -216,7 +207,7 @@ async function processRendering(job) {
     })
     .eq("id", jobId);
 
-  console.log("Completed:", jobId);
+  console.log("✅ Completed:", jobId);
 }
 
 /* ==============================
@@ -246,8 +237,9 @@ async function loop() {
       if (rendering?.length) {
         await processRendering(rendering[0]);
       }
+
     } catch (err) {
-      console.error("Worker error:", err);
+      console.error("❌ Worker error:", err);
     }
 
     await sleep(5000);
