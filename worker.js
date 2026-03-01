@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { spawn } from "child_process";
+import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
 
@@ -18,6 +19,7 @@ function mustEnv(name) {
 
 const SUPABASE_URL = mustEnv("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+const OPENAI_API_KEY = mustEnv("OPENAI_API_KEY");
 
 const HEYGEN_API_KEY = mustEnv("HEYGEN_API_KEY");
 const HEYGEN_CALLBACK_BASE_URL = mustEnv("HEYGEN_CALLBACK_BASE_URL");
@@ -29,9 +31,9 @@ const STORAGE_BUCKET = process.env.STORAGE_BUCKET || "videos";
 const POLL_MS = Number(process.env.POLL_MS || 5000);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 console.log("🚀 WORKER LIVE");
-console.log("Polling every", POLL_MS, "ms");
 
 /* ==============================
    UTILS
@@ -42,7 +44,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", args);
-
     ff.stderr.on("data", (d) => console.log(d.toString()));
     ff.on("close", (code) => {
       if (code === 0) resolve();
@@ -60,14 +61,12 @@ async function downloadFile(url, outPath) {
 async function uploadToStorage(localPath, storagePath) {
   const buffer = fs.readFileSync(localPath);
 
-  const { error } = await supabase.storage
+  await supabase.storage
     .from(STORAGE_BUCKET)
     .upload(storagePath, buffer, {
       contentType: "video/mp4",
       upsert: true,
     });
-
-  if (error) throw error;
 
   const { data } = supabase.storage
     .from(STORAGE_BUCKET)
@@ -77,16 +76,61 @@ async function uploadToStorage(localPath, storagePath) {
 }
 
 /* ==============================
-   HEYGEN: CREATE VIDEO
+   AUDIO → TRANSCRIBE → SUMMARY
+============================== */
+
+async function extractAudio(videoPath, audioPath) {
+  await runFFmpeg([
+    "-y",
+    "-i", videoPath,
+    "-vn",
+    "-acodec", "mp3",
+    audioPath,
+  ]);
+}
+
+async function generateAvatarScript(walkthroughUrl, jobId) {
+  const tmp = "/tmp";
+  const videoPath = `${tmp}/walk-${jobId}.mp4`;
+  const audioPath = `${tmp}/audio-${jobId}.mp3`;
+
+  await downloadFile(walkthroughUrl, videoPath);
+  await extractAudio(videoPath, audioPath);
+
+  console.log("🧠 Transcribing walkthrough audio...");
+
+  const transcript = await openai.audio.transcriptions.create({
+    file: fs.createReadStream(audioPath),
+    model: "whisper-1",
+  });
+
+  console.log("✍️ Generating summary script...");
+
+  const summary = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "Summarise this property walkthrough into a confident 20-second professional real estate script spoken by an agent."
+      },
+      {
+        role: "user",
+        content: transcript.text,
+      },
+    ],
+  });
+
+  return summary.choices[0].message.content;
+}
+
+/* ==============================
+   HEYGEN VIDEO CREATE
 ============================== */
 
 async function createHeygenVideo({ scriptText, jobId }) {
   const callbackUrl =
-    `${HEYGEN_CALLBACK_BASE_URL}` +
-    `?token=${encodeURIComponent(HEYGEN_WEBHOOK_SECRET)}` +
-    `&job_id=${encodeURIComponent(jobId)}`;
-
-  console.log("🎬 Creating HeyGen video for job:", jobId);
+    `${HEYGEN_CALLBACK_BASE_URL}?token=${encodeURIComponent(HEYGEN_WEBHOOK_SECRET)}&job_id=${encodeURIComponent(jobId)}`;
 
   const payload = {
     video_inputs: [
@@ -110,12 +154,7 @@ async function createHeygenVideo({ scriptText, jobId }) {
   });
 
   const json = await resp.json();
-
-  const videoId = json?.data?.video_id;
-  if (!videoId) throw new Error("HeyGen did not return video_id");
-
-  console.log("✅ HEYGEN VIDEO ID:", videoId);
-  return videoId;
+  return json?.data?.video_id;
 }
 
 /* ==============================
@@ -135,10 +174,12 @@ async function processQueued(job) {
 
   if (!locked) return;
 
-  console.log("📦 Processing QUEUED job:", jobId);
+  console.log("📦 Processing job:", jobId);
 
-  const script =
-    "Welcome to this beautiful new listing. Contact us today to arrange your private viewing.";
+  const script = await generateAvatarScript(
+    locked.walkthrough_url,
+    jobId
+  );
 
   const videoId = await createHeygenVideo({ scriptText: script, jobId });
 
@@ -149,8 +190,6 @@ async function processQueued(job) {
       heygen_video_id: videoId,
     })
     .eq("id", jobId);
-
-  console.log("⏳ Waiting for webhook...");
 }
 
 /* ==============================
@@ -168,28 +207,26 @@ async function processRendering(job) {
     .select("*")
     .maybeSingle();
 
-  if (!locked) return;
-
-  if (!locked.heygen_video_url) {
-    await supabase.from("render_jobs").update({ status: "rendering" }).eq("id", jobId);
-    return;
-  }
+  if (!locked || !locked.heygen_video_url) return;
 
   console.log("🎬 Compositing final video:", jobId);
 
   const tmp = "/tmp";
-  const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
-  const avatarPath = path.join(tmp, `avatar-${jobId}.mp4`);
-  const finalPath = path.join(tmp, `final-${jobId}.mp4`);
+  const walkPath = `${tmp}/walk-${jobId}.mp4`;
+  const avatarPath = `${tmp}/avatar-${jobId}.mp4`;
+  const finalPath = `${tmp}/final-${jobId}.mp4`;
 
   await downloadFile(locked.walkthrough_url, walkPath);
   await downloadFile(locked.heygen_video_url, avatarPath);
 
   const filter =
     `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
-    `pad=1080:1920:(ow-iw)/2:(oh-ih)/2[vbg];` +
-    `[1:v]scale=460:-2,colorkey=0x00FF00:0.35:0.2[av];` +
-    `[vbg][av]overlay=W-w-60:H-h-180[outv]`;
+    `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,` +
+    `drawbox=x=0:y=1650:w=1080:h=200:color=black@0.6:t=fill,` +
+    `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:` +
+    `text='Luxury Family Home':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=1700[vbg];` +
+    `[1:v]scale=520:-2,colorkey=0x00FF00:0.35:0.2[av];` +
+    `[vbg][av]overlay=W-w-80:H-h-420[outv]`;
 
   await runFFmpeg([
     "-y",
@@ -198,6 +235,7 @@ async function processRendering(job) {
     "-filter_complex", filter,
     "-map", "[outv]",
     "-map", "1:a?",
+    "-shortest",
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "23",
@@ -219,7 +257,7 @@ async function processRendering(job) {
     })
     .eq("id", jobId);
 
-  console.log("✅ Branded video complete:", jobId);
+  console.log("✅ Completed:", jobId);
 
   fs.unlinkSync(walkPath);
   fs.unlinkSync(avatarPath);
