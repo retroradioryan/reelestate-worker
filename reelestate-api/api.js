@@ -6,18 +6,17 @@ import { createClient } from "@supabase/supabase-js";
 ============================== */
 
 function mustEnv(name) {
-  const v = process.env[name];
-  if (!v) {
+  const value = process.env[name];
+  if (!value) {
     console.error(`❌ Missing environment variable: ${name}`);
     process.exit(1);
   }
-  return v;
+  return value;
 }
 
 const SUPABASE_URL = mustEnv("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
 const HEYGEN_API_KEY = mustEnv("HEYGEN_API_KEY");
-
 const HEYGEN_WEBHOOK_SECRET = process.env.HEYGEN_WEBHOOK_SECRET || null;
 
 /* ==============================
@@ -32,7 +31,7 @@ const supabase = createClient(
   SUPABASE_SERVICE_ROLE_KEY
 );
 
-console.log("🔥 REELESTATE API (STABLE BUILD) LOADED");
+console.log("🔥 REELESTATE API (FINAL BUILD) LOADED");
 
 /* ==============================
    HEALTH
@@ -111,7 +110,7 @@ app.get("/job/:id", async (req, res) => {
 });
 
 /* ==============================
-   FETCH HEYGEN VIDEO STATUS (CORRECT V2 ENDPOINT)
+   FETCH HEYGEN VIDEO (CORRECT ENDPOINT)
 ============================== */
 
 async function fetchHeyGenVideoUrl(videoId) {
@@ -120,36 +119,44 @@ async function fetchHeyGenVideoUrl(videoId) {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 
-    console.log(`🎬 Checking HeyGen status for ${videoId} (attempt ${attempt})`);
+    console.log(`🎬 Checking HeyGen video ${videoId} (attempt ${attempt})`);
 
-    const resp = await fetch(
-      `https://api.heygen.com/v2/video/status?video_id=${videoId}`,
-      {
-        headers: {
-          "X-Api-Key": HEYGEN_API_KEY,
-          "Content-Type": "application/json",
-        },
+    try {
+      const resp = await fetch(
+        `https://api.heygen.com/v2/video/${videoId}`,
+        {
+          method: "GET",
+          headers: {
+            "X-Api-Key": HEYGEN_API_KEY,
+          },
+        }
+      );
+
+      console.log("HeyGen HTTP status:", resp.status);
+
+      const json = await resp.json().catch(() => null);
+      console.log("HeyGen response:", JSON.stringify(json, null, 2));
+
+      if (!resp.ok) {
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
       }
-    );
 
-    console.log("HeyGen HTTP status:", resp.status);
+      const status = json?.data?.status;
+      const videoUrl =
+        json?.data?.video_url ||
+        json?.data?.url ||
+        null;
 
-    const json = await resp.json().catch(() => null);
-    console.log("HeyGen response:", JSON.stringify(json, null, 2));
+      if (status === "completed" && videoUrl) {
+        return videoUrl;
+      }
 
-    if (!resp.ok) {
-      await new Promise((r) => setTimeout(r, delayMs));
-      continue;
+    } catch (err) {
+      console.error("HeyGen fetch error:", err.message);
     }
 
-    const status = json?.data?.status;
-    const videoUrl = json?.data?.video_url || null;
-
-    if (status === "completed" && videoUrl) {
-      return videoUrl;
-    }
-
-    await new Promise((r) => setTimeout(r, delayMs));
+    await new Promise(r => setTimeout(r, delayMs));
   }
 
   return null;
@@ -157,22 +164,19 @@ async function fetchHeyGenVideoUrl(videoId) {
 
 /* ==============================
    HEYGEN WEBHOOK
-   - Does NOT trust payload shape
-   - Uses job_id from query
-   - Fetches video URL directly from HeyGen
 ============================== */
 
 app.post("/heygen-callback", async (req, res) => {
-  try {
-    // Respond immediately (important)
-    res.json({ ok: true });
 
+  // Respond immediately so HeyGen doesn't retry
+  res.json({ ok: true });
+
+  try {
     const token = req.query?.token;
     const jobId = req.query?.job_id;
 
     console.log("📩 Webhook received for job:", jobId);
 
-    // Token validation (if enabled)
     if (HEYGEN_WEBHOOK_SECRET) {
       if (!token || token !== HEYGEN_WEBHOOK_SECRET) {
         console.log("❌ Invalid webhook token");
@@ -181,11 +185,10 @@ app.post("/heygen-callback", async (req, res) => {
     }
 
     if (!jobId) {
-      console.log("❌ Missing job_id in webhook");
+      console.log("❌ Missing job_id");
       return;
     }
 
-    // Fetch job from DB
     const { data: job, error } = await supabase
       .from("render_jobs")
       .select("*")
@@ -220,7 +223,7 @@ app.post("/heygen-callback", async (req, res) => {
     console.log("✅ Job moved to rendering:", jobId);
 
   } catch (err) {
-    console.error("❌ Webhook error:", err);
+    console.error("❌ Webhook processing error:", err);
   }
 });
 
