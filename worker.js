@@ -1,9 +1,8 @@
-// worker.js (FINAL FIXED — HeyGen callback at root level)
+// worker.js (RESTORED WORKING VERSION + HARD DEBUG)
 
 import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import fs from "fs";
-import path from "path";
 import OpenAI from "openai";
 
 /* ==============================
@@ -23,80 +22,38 @@ const supabase = createClient(
 
 const openai = new OpenAI({ apiKey: mustEnv("OPENAI_API_KEY") });
 
-const BUCKET = process.env.STORAGE_BUCKET || "videos";
-const POLL_MS = Number(process.env.POLL_MS || 5000);
-
-// ---- HEYGEN ----
 const HEYGEN_API_KEY = mustEnv("HEYGEN_API_KEY");
 const HEYGEN_CALLBACK_BASE_URL = mustEnv("HEYGEN_CALLBACK_BASE_URL");
 const HEYGEN_WEBHOOK_SECRET = mustEnv("HEYGEN_WEBHOOK_SECRET");
 const HEYGEN_AVATAR_ID = mustEnv("HEYGEN_AVATAR_ID");
 const HEYGEN_VOICE_ID = mustEnv("HEYGEN_VOICE_ID");
 
+const POLL_MS = 5000;
+
 console.log("🚀 WORKER LIVE");
-console.log("Callback Base:", HEYGEN_CALLBACK_BASE_URL);
+console.log("HEYGEN_CALLBACK_BASE_URL:", HEYGEN_CALLBACK_BASE_URL);
+console.log("HEYGEN_WEBHOOK_SECRET:", HEYGEN_WEBHOOK_SECRET);
 
 /* ==============================
-   UTIL
+   UTILS
 ============================== */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function runFFmpeg(args) {
-  return new Promise((resolve, reject) => {
-    const ff = spawn("ffmpeg", args);
-    ff.stderr.on("data", (d) => console.log(d.toString()));
-    ff.on("error", reject);
-    ff.on("close", (code) =>
-      code === 0 ? resolve() : reject(new Error(`FFmpeg exited ${code}`))
-    );
-  });
-}
-
 async function fetchRetry(url, opts = {}) {
   const resp = await fetch(url, opts);
+  const text = await resp.text().catch(() => "");
+
   if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    throw new Error(`HTTP ${resp.status} ${txt}`);
+    console.error("❌ HTTP ERROR:", resp.status, text);
+    throw new Error(text);
   }
-  return resp;
+
+  return JSON.parse(text);
 }
 
 /* ==============================
-   TRANSCRIBE + REWRITE
-============================== */
-
-async function transcribeAudio(audioPath) {
-  const result = await openai.audio.transcriptions.create({
-    model: "whisper-1",
-    file: fs.createReadStream(audioPath),
-  });
-
-  return (result?.text || "").trim();
-}
-
-async function rewriteScript(transcript, maxSeconds = 30) {
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.6,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a real estate presenter. Write a natural spoken script. No emojis. No headings. End with a call to action.",
-      },
-      {
-        role: "user",
-        content: transcript,
-      },
-    ],
-  });
-
-  return (resp.choices?.[0]?.message?.content || "").trim();
-}
-
-/* ==============================
-   HEYGEN CREATE (FIXED)
+   HEYGEN CREATE (WORKING STRUCTURE)
 ============================== */
 
 async function createHeygenVideoFromText({ scriptText, jobId }) {
@@ -105,9 +62,11 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
     `?token=${encodeURIComponent(HEYGEN_WEBHOOK_SECRET)}` +
     `&job_id=${encodeURIComponent(jobId)}`;
 
-  console.log("---- HEYGEN CALLBACK DEBUG ----");
+  console.log("=================================");
+  console.log("CREATING HEYGEN VIDEO");
+  console.log("Job ID:", jobId);
   console.log("Callback URL:", callbackUrl);
-  console.log("--------------------------------");
+  console.log("=================================");
 
   const payload = {
     video_inputs: [
@@ -127,13 +86,17 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
         },
       },
     ],
-    dimension: { width: 1080, height: 1920 },
-
-    // ✅ THIS IS THE FIX — MOVED TO ROOT
-    callback_url: callbackUrl,
+    dimension: {
+      width: 1080,
+      height: 1920,
+    },
+    callback_url: callbackUrl, // ROOT LEVEL (THIS WAS CORRECT)
   };
 
-  const resp = await fetchRetry(
+  console.log("Sending payload to HeyGen...");
+  console.log(JSON.stringify(payload, null, 2));
+
+  const json = await fetchRetry(
     "https://api.heygen.com/v2/video/generate",
     {
       method: "POST",
@@ -145,10 +108,13 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
     }
   );
 
-  const json = await resp.json();
+  console.log("HeyGen response:", JSON.stringify(json, null, 2));
+
   const videoId = json?.data?.video_id;
 
-  if (!videoId) throw new Error("HeyGen did not return video_id");
+  if (!videoId) {
+    throw new Error("HeyGen did not return video_id");
+  }
 
   console.log("✅ HEYGEN VIDEO ID:", videoId);
   return videoId;
@@ -160,10 +126,11 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
 
 async function processQueued(job) {
   const jobId = job.id;
+
   console.log("📦 Processing job:", jobId);
 
-  const transcript = "Test transcript for now"; // Simplified for clarity
-  const script = await rewriteScript(transcript, 20);
+  // Simpler test script so we remove OpenAI from equation for now
+  const script = "Welcome to this beautiful new listing. Contact us today to arrange a viewing.";
 
   const videoId = await createHeygenVideoFromText({
     scriptText: script,
