@@ -1,4 +1,4 @@
-// worker.js (FULL PRODUCTION VERSION — QUEUED + RENDERING SUPPORT)
+// worker.js (PRODUCTION STABLE VERSION — LOCKED + SAFE LOOP)
 
 import { createClient } from "@supabase/supabase-js";
 import fs from "fs";
@@ -38,6 +38,7 @@ const supabase = createClient(
 );
 
 console.log("🚀 WORKER LIVE");
+console.log("Polling every", POLL_MS, "ms");
 
 /* ==============================
    UTIL
@@ -63,7 +64,6 @@ async function fetchJSON(url, options = {}) {
 
 async function downloadFile(url, outputPath) {
   const response = await fetch(url);
-
   if (!response.ok) {
     throw new Error(`Download failed: ${response.status}`);
   }
@@ -131,11 +131,25 @@ async function createHeygenVideo({ scriptText, jobId }) {
 }
 
 /* ==============================
-   PROCESS QUEUED
+   PROCESS QUEUED (WITH LOCK)
 ============================== */
 
 async function processQueued(job) {
   const jobId = job.id;
+
+  // Lock job to prevent duplicates
+  const { data: locked } = await supabase
+    .from("render_jobs")
+    .update({ status: "processing" })
+    .eq("id", jobId)
+    .eq("status", "queued")
+    .select()
+    .maybeSingle();
+
+  if (!locked) {
+    console.log("⏭️ Job already taken:", jobId);
+    return;
+  }
 
   console.log("📦 Processing QUEUED job:", jobId);
 
@@ -159,11 +173,24 @@ async function processQueued(job) {
 }
 
 /* ==============================
-   PROCESS RENDERING
+   PROCESS RENDERING (WITH LOCK)
 ============================== */
 
 async function processRendering(job) {
   const jobId = job.id;
+
+  const { data: locked } = await supabase
+    .from("render_jobs")
+    .update({ status: "rendering_in_progress" })
+    .eq("id", jobId)
+    .eq("status", "rendering")
+    .select()
+    .maybeSingle();
+
+  if (!locked) {
+    console.log("⏭️ Rendering already in progress:", jobId);
+    return;
+  }
 
   console.log("🎞 Processing RENDERING job:", jobId);
 
@@ -176,7 +203,6 @@ async function processRendering(job) {
 
   await downloadFile(job.heygen_video_url, tmpPath);
 
-  // For now: just mark completed
   await supabase
     .from("render_jobs")
     .update({
@@ -195,7 +221,7 @@ async function processRendering(job) {
 async function loop() {
   while (true) {
     try {
-      // 1️⃣ Check queued
+      // 1️⃣ Look for queued jobs
       const { data: queued } = await supabase
         .from("render_jobs")
         .select("*")
@@ -208,7 +234,7 @@ async function loop() {
         continue;
       }
 
-      // 2️⃣ Check rendering
+      // 2️⃣ Look for rendering jobs
       const { data: rendering } = await supabase
         .from("render_jobs")
         .select("*")
@@ -218,8 +244,9 @@ async function loop() {
       if (rendering?.length) {
         await processRendering(rendering[0]);
       }
+
     } catch (err) {
-      console.error("Worker error:", err.message);
+      console.error("❌ Worker error:", err.message);
     }
 
     await sleep(POLL_MS);
