@@ -31,7 +31,7 @@ const supabase = createClient(
   SUPABASE_SERVICE_ROLE_KEY
 );
 
-console.log("🔥 REELESTATE API (FINAL BUILD) LOADED");
+console.log("🔥 REELESTATE API (RPC STATUS VERSION) LOADED");
 
 /* ==============================
    HEALTH
@@ -110,7 +110,7 @@ app.get("/job/:id", async (req, res) => {
 });
 
 /* ==============================
-   FETCH HEYGEN VIDEO (CORRECT ENDPOINT)
+   FETCH HEYGEN VIDEO (RPC STYLE)
 ============================== */
 
 async function fetchHeyGenVideoUrl(videoId) {
@@ -123,12 +123,14 @@ async function fetchHeyGenVideoUrl(videoId) {
 
     try {
       const resp = await fetch(
-        `https://api.heygen.com/v2/video/${videoId}`,
+        "https://api.heygen.com/v1/video.status",
         {
-          method: "GET",
+          method: "POST",
           headers: {
+            "Content-Type": "application/json",
             "X-Api-Key": HEYGEN_API_KEY,
           },
+          body: JSON.stringify({ video_id: videoId }),
         }
       );
 
@@ -143,10 +145,7 @@ async function fetchHeyGenVideoUrl(videoId) {
       }
 
       const status = json?.data?.status;
-      const videoUrl =
-        json?.data?.video_url ||
-        json?.data?.url ||
-        null;
+      const videoUrl = json?.data?.video_url;
 
       if (status === "completed" && videoUrl) {
         return videoUrl;
@@ -168,7 +167,7 @@ async function fetchHeyGenVideoUrl(videoId) {
 
 app.post("/heygen-callback", async (req, res) => {
 
-  // Respond immediately so HeyGen doesn't retry
+  // Respond immediately so HeyGen stops retrying
   res.json({ ok: true });
 
   try {
