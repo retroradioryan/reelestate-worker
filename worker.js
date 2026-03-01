@@ -86,8 +86,10 @@ async function createHeygenVideo(scriptText) {
             },
             voice: {
               type: "text",
-              text: scriptText,
               voice_id: mustEnv("HEYGEN_VOICE_ID"),
+              text: {
+                input_text: scriptText.trim(),
+              },
             },
             background: {
               type: "color",
@@ -100,12 +102,13 @@ async function createHeygenVideo(scriptText) {
     }
   );
 
+  const bodyText = await resp.text();
+
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`HeyGen error: ${text}`);
+    throw new Error(`HeyGen error: ${bodyText}`);
   }
 
-  const json = await resp.json();
+  const json = JSON.parse(bodyText);
   const videoId = json?.data?.video_id;
 
   if (!videoId) throw new Error("No video_id returned");
@@ -115,7 +118,7 @@ async function createHeygenVideo(scriptText) {
 }
 
 /* ==============================
-   PHASE 1 — QUEUED
+   PHASE 1 — PROCESS QUEUED
 ============================== */
 
 async function processQueued(job) {
@@ -127,13 +130,13 @@ async function processQueued(job) {
 
   await downloadToFile(job.walkthrough_url, walkPath);
 
-  // TEMP AI SCRIPT (Replace later with GPT summary)
+  // TEMP SCRIPT (Replace with GPT summary later)
   const scriptText = `
-  Welcome to this stunning property.
-  This beautifully presented home offers bright living spaces,
-  modern finishes, and an exceptional location.
-  Book your private viewing today.
-  `;
+Welcome to this stunning property.
+This beautifully presented home offers bright living spaces,
+modern finishes, and an exceptional location.
+Book your private viewing today.
+`;
 
   const videoId = await createHeygenVideo(scriptText);
 
@@ -147,7 +150,7 @@ async function processQueued(job) {
 }
 
 /* ==============================
-   PHASE 2 — RENDERING
+   PHASE 2 — RENDER FINAL
 ============================== */
 
 async function processRendering(job) {
