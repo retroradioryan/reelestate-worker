@@ -22,7 +22,7 @@ const supabase = createClient(
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-console.log("Worker started...");
+console.log("🔥 NEW WORKER VERSION LOADED 🔥");
 
 /* ==============================
    DOWNLOAD FILE
