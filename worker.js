@@ -25,7 +25,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 console.log("Worker started...");
 
 /* ==============================
-   UTIL: DOWNLOAD FILE
+   DOWNLOAD FILE
 ============================== */
 
 async function downloadToFile(url, outPath) {
@@ -44,7 +44,7 @@ async function downloadToFile(url, outPath) {
 }
 
 /* ==============================
-   UTIL: RUN FFMPEG
+   RUN FFMPEG
 ============================== */
 
 function runFFmpeg(args) {
@@ -62,7 +62,7 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN CREATE (TEXT MODE)
+   CREATE HEYGEN VIDEO (TEXT MODE)
 ============================== */
 
 async function createHeygenVideo(scriptText) {
@@ -84,31 +84,29 @@ async function createHeygenVideo(scriptText) {
               type: "avatar",
               avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
             },
-            voice: {
-              type: "text",
-              voice_id: mustEnv("HEYGEN_VOICE_ID"),
-              text: {
-                input_text: scriptText.trim(),
-              },
-            },
+            input_text: scriptText.trim(),
+            voice_id: mustEnv("HEYGEN_VOICE_ID"),
             background: {
               type: "color",
               value: "#00FF00",
             },
           },
         ],
-        dimension: { width: 1080, height: 1920 },
+        dimension: {
+          width: 1080,
+          height: 1920,
+        },
       }),
     }
   );
 
-  const bodyText = await resp.text();
+  const body = await resp.text();
 
   if (!resp.ok) {
-    throw new Error(`HeyGen error: ${bodyText}`);
+    throw new Error(`HeyGen error: ${body}`);
   }
 
-  const json = JSON.parse(bodyText);
+  const json = JSON.parse(body);
   const videoId = json?.data?.video_id;
 
   if (!videoId) throw new Error("No video_id returned");
@@ -118,7 +116,7 @@ async function createHeygenVideo(scriptText) {
 }
 
 /* ==============================
-   PHASE 1 — PROCESS QUEUED
+   PROCESS QUEUED JOB
 ============================== */
 
 async function processQueued(job) {
@@ -130,7 +128,7 @@ async function processQueued(job) {
 
   await downloadToFile(job.walkthrough_url, walkPath);
 
-  // TEMP SCRIPT (Replace with GPT summary later)
+  // TEMP SCRIPT (Replace later with GPT summary)
   const scriptText = `
 Welcome to this stunning property.
 This beautifully presented home offers bright living spaces,
@@ -150,7 +148,7 @@ Book your private viewing today.
 }
 
 /* ==============================
-   PHASE 2 — RENDER FINAL
+   PROCESS RENDERING JOB
 ============================== */
 
 async function processRendering(job) {
