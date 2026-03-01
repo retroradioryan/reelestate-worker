@@ -22,13 +22,14 @@ const supabase = createClient(
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+console.log("Worker started...");
+
 /* ==============================
    UTIL: DOWNLOAD FILE
 ============================== */
 
 async function downloadToFile(url, outPath) {
   const resp = await fetch(url);
-
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`Download failed: ${resp.status} ${text}`);
@@ -61,10 +62,13 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   HEYGEN CREATE VIDEO
+   HEYGEN CREATE (TEXT MODE)
 ============================== */
 
-async function createHeygenVideo(audioUrl) {
+async function createHeygenVideo(scriptText) {
+  console.log("Sending script to HeyGen:");
+  console.log(scriptText);
+
   const resp = await fetch(
     "https://api.heygen.com/v2/video/generate",
     {
@@ -81,8 +85,9 @@ async function createHeygenVideo(audioUrl) {
               avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
             },
             voice: {
-              type: "audio",
-              audio_url: audioUrl,
+              type: "text",
+              text: scriptText,
+              voice_id: mustEnv("HEYGEN_VOICE_ID"),
             },
             background: {
               type: "color",
@@ -110,7 +115,7 @@ async function createHeygenVideo(audioUrl) {
 }
 
 /* ==============================
-   PHASE 1 — PROCESS QUEUED
+   PHASE 1 — QUEUED
 ============================== */
 
 async function processQueued(job) {
@@ -119,44 +124,19 @@ async function processQueued(job) {
 
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
-  const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
 
-  // Download walkthrough
   await downloadToFile(job.walkthrough_url, walkPath);
 
-  // Extract audio
-  await runFFmpeg([
-    "-y",
-    "-i",
-    walkPath,
-    "-vn",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    audioPath,
-  ]);
+  // TEMP AI SCRIPT (Replace later with GPT summary)
+  const scriptText = `
+  Welcome to this stunning property.
+  This beautifully presented home offers bright living spaces,
+  modern finishes, and an exceptional location.
+  Book your private viewing today.
+  `;
 
-  // Upload audio
-  const audioBuffer = fs.readFileSync(audioPath);
-  const storagePath = `renders/audio-${jobId}.m4a`;
+  const videoId = await createHeygenVideo(scriptText);
 
-  const { error } = await supabase.storage
-    .from(BUCKET)
-    .upload(storagePath, audioBuffer, {
-      contentType: "audio/mp4",
-      upsert: true,
-    });
-
-  if (error) throw error;
-
-  const { data: pub } =
-    supabase.storage.from(BUCKET).getPublicUrl(storagePath);
-
-  // Send to HeyGen
-  const videoId = await createHeygenVideo(pub.publicUrl);
-
-  // Update DB
   await supabase
     .from("render_jobs")
     .update({
@@ -167,12 +147,12 @@ async function processQueued(job) {
 }
 
 /* ==============================
-   PHASE 2 — RENDER FINAL
+   PHASE 2 — RENDERING
 ============================== */
 
 async function processRendering(job) {
   const jobId = job.id;
-  console.log("Rendering:", jobId);
+  console.log("Rendering FINAL:", jobId);
 
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
@@ -195,7 +175,7 @@ async function processRendering(job) {
     "-map",
     "[outv]",
     "-map",
-    "1:a?",
+    "1:a",
     "-c:v",
     "libx264",
     "-preset",
@@ -270,5 +250,4 @@ async function loop() {
   }
 }
 
-console.log("Worker started...");
 loop();
