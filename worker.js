@@ -1,9 +1,9 @@
-// worker.js (FULL REWRITE)
-// - Downloads walkthrough
+// worker.js (FULL REWRITE — Node 22 SAFE)
+// - Downloads walkthrough (STREAMING, no arrayBuffer)
 // - Extracts audio
 // - Transcribes with OpenAI Whisper
 // - Rewrites into a tight presenter script (maxSeconds)
-// - Sends TEXT voice to HeyGen (with green background)
+// - Sends TEXT voice to HeyGen (green background)
 // - HeyGen webhook updates render_jobs -> status=rendering + heygen_video_url
 // - Worker composites walkthrough + keyed avatar (BOTTOM RIGHT)
 // - Uploads final MP4 to Supabase + marks job completed
@@ -35,19 +35,21 @@ const BUCKET = process.env.STORAGE_BUCKET || "videos";
 const POLL_MS = Number(process.env.POLL_MS || 5000);
 
 // ---- KEYING ----
-const KEY_COLOR_HEX = process.env.KEY_COLOR_HEX || "#00FF00";
-const KEY_COLOR_FFMPEG = (process.env.KEY_COLOR_FFMPEG || "0x00FF00").trim();
+const KEY_COLOR_HEX = process.env.KEY_COLOR_HEX || "#00FF00"; // HeyGen background
+const KEY_COLOR_FFMPEG = (process.env.KEY_COLOR_FFMPEG || "0x00FF00").trim(); // ffmpeg colorkey expects 0xRRGGBB
 const KEY_SIMILARITY = String(process.env.KEY_SIMILARITY || "0.35");
 const KEY_BLEND = String(process.env.KEY_BLEND || "0.20");
 
 // ---- OVERLAY (BOTTOM RIGHT defaults) ----
 const OVERLAY_SCALE_W = Number(process.env.OVERLAY_SCALE_W || 480);
-const OVERLAY_MARGIN_X = Number(process.env.OVERLAY_MARGIN_X || 90);
-const OVERLAY_MARGIN_Y = Number(process.env.OVERLAY_MARGIN_Y || 260);
+const OVERLAY_MARGIN_X = Number(process.env.OVERLAY_MARGIN_X || 60);  // distance from RIGHT edge
+const OVERLAY_MARGIN_Y = Number(process.env.OVERLAY_MARGIN_Y || 120); // distance from BOTTOM edge
 
 // ---- SAFETY ----
 const MAX_WALK_DOWNLOAD_MB = Number(process.env.MAX_WALK_DOWNLOAD_MB || 250);
 const MAX_AVATAR_DOWNLOAD_MB = Number(process.env.MAX_AVATAR_DOWNLOAD_MB || 500);
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 120000); // 120s
+const FETCH_RETRIES = Number(process.env.FETCH_RETRIES || 3);
 
 // ---- HEYGEN ----
 const HEYGEN_CALLBACK_BASE_URL = mustEnv("HEYGEN_CALLBACK_BASE_URL"); // e.g. https://reelestate-api-xxxx.onrender.com/heygen-callback
@@ -61,28 +63,82 @@ console.log("🚀 WORKER LIVE (transcribe → rewrite → HeyGen → composite)"
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ==============================
-   UTIL: DOWNLOAD FILE (Node 22 safe)
-   - Uses resp.arrayBuffer() (Web Streams)
-   - Enforces max size
+   UTIL: FETCH WITH TIMEOUT + RETRY
+============================== */
+async function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...opts, signal: controller.signal });
+    return resp;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function fetchRetry(url, opts = {}, retries = FETCH_RETRIES) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const resp = await fetchWithTimeout(url, opts);
+      return resp;
+    } catch (err) {
+      lastErr = err;
+      console.error(`⚠️ fetch attempt ${attempt}/${retries} failed:`, err?.message || err);
+      // small backoff
+      await sleep(800 * attempt);
+    }
+  }
+  throw lastErr || new Error("fetch failed");
+}
+
+/* ==============================
+   UTIL: DOWNLOAD FILE (Node 22 safe streaming)
+   Uses Web Streams reader (resp.body.getReader()).
+   Avoids resp.body.on and avoids arrayBuffer memory blowups.
 ============================== */
 async function downloadToFile(url, outPath, { maxMB } = {}) {
   if (!url || !url.startsWith("http")) throw new Error(`Invalid URL: ${url}`);
 
-  const resp = await fetch(url);
+  const resp = await fetchRetry(url, { method: "GET" });
+
   if (!resp.ok) {
-    const text = await resp.text();
+    const text = await resp.text().catch(() => "");
     throw new Error(`Download failed: ${resp.status} ${text}`);
   }
 
-  const arrayBuffer = await resp.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
-  const maxBytes = (maxMB || 9999) * 1024 * 1024;
-  if (buffer.length > maxBytes) {
-    throw new Error(`File too large (>${maxMB}MB)`);
+  if (!resp.body || typeof resp.body.getReader !== "function") {
+    // This should not happen in Node 22, but guard anyway.
+    const ab = await resp.arrayBuffer();
+    const buf = Buffer.from(ab);
+    const maxBytes = (maxMB || 9999) * 1024 * 1024;
+    if (buf.length > maxBytes) throw new Error(`File too large (>${maxMB}MB)`);
+    fs.writeFileSync(outPath, buf);
+    return;
   }
 
-  fs.writeFileSync(outPath, buffer);
+  const reader = resp.body.getReader();
+  const fileStream = fs.createWriteStream(outPath);
+
+  const maxBytes = (maxMB || 9999) * 1024 * 1024;
+  let downloaded = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      // value is a Uint8Array
+      downloaded += value.byteLength;
+      if (downloaded > maxBytes) {
+        throw new Error(`File too large (>${maxMB}MB)`);
+      }
+
+      fileStream.write(Buffer.from(value));
+    }
+  } finally {
+    fileStream.end();
+  }
 }
 
 /* ==============================
@@ -149,6 +205,7 @@ function targetWordsForSeconds(maxSeconds) {
 
 async function rewriteToPresenterScript(transcript, maxSeconds = 30) {
   const targetWords = targetWordsForSeconds(maxSeconds);
+
   console.log(
     `✍️ Rewriting transcript → presenter script (~${maxSeconds}s, ~${targetWords} words)…`
   );
@@ -210,7 +267,7 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
     dimension: { width: 1080, height: 1920 },
   };
 
-  const resp = await fetch("https://api.heygen.com/v2/video/generate", {
+  const resp = await fetchRetry("https://api.heygen.com/v2/video/generate", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -219,7 +276,7 @@ async function createHeygenVideoFromText({ scriptText, jobId }) {
     body: JSON.stringify(payload),
   });
 
-  const bodyText = await resp.text();
+  const bodyText = await resp.text().catch(() => "");
   if (!resp.ok) throw new Error(`HeyGen error: ${bodyText}`);
 
   const json = JSON.parse(bodyText);
@@ -309,7 +366,7 @@ async function processQueued(job) {
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
   const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
 
-  // 1) download walkthrough
+  // 1) download walkthrough (streaming)
   await downloadToFile(job.walkthrough_url, walkPath, { maxMB: MAX_WALK_DOWNLOAD_MB });
 
   // 2) extract audio
@@ -324,14 +381,14 @@ async function processQueued(job) {
   // 5) create HeyGen green-screen avatar (text voice)
   const heygenVideoId = await createHeygenVideoFromText({ scriptText, jobId });
 
-  // 6) update job
+  // 6) update job (optional transcript/script columns)
   await updateJobSafe(
     jobId,
     {
       status: "heygen_requested",
       heygen_video_id: heygenVideoId,
-      transcript_text: transcript, // optional column
-      script_text: scriptText,     // optional column
+      transcript_text: transcript, // optional
+      script_text: scriptText,     // optional
     },
     {
       status: "heygen_requested",
@@ -375,6 +432,7 @@ async function processRendering(job) {
   const avatarPath = path.join(tmp, `avatar-${jobId}.mp4`);
   const finalPath = path.join(tmp, `final-${jobId}.mp4`);
 
+  // downloads (streaming)
   await downloadToFile(job.walkthrough_url, walkPath, { maxMB: MAX_WALK_DOWNLOAD_MB });
   await downloadToFile(job.heygen_video_url, avatarPath, { maxMB: MAX_AVATAR_DOWNLOAD_MB });
 
@@ -447,7 +505,7 @@ async function loop() {
         continue;
       }
 
-      // 2) rendering job
+      // 2) rendering job (set by webhook)
       const { data: rendering, error: rErr } = await supabase
         .from("render_jobs")
         .select("*")
@@ -466,7 +524,7 @@ async function loop() {
         }
       }
     } catch (err) {
-      console.error("❌ Worker loop error:", err);
+      console.error("❌ Worker loop error:", err?.message || err);
     }
 
     await sleep(POLL_MS);
