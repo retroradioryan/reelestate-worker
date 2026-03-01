@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: reelestate-api
+    env: node
+    rootDir: reelestate-api
+    buildCommand: npm install
+    startCommand: npm start
+
+  - type: worker
+    name: reelestate-worker
+    env: node
+    buildCommand: npm install
+    startCommand: node worker.js
