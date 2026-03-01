@@ -1,8 +1,19 @@
+// worker.js (FULL REWRITE)
+// - Downloads walkthrough
+// - Extracts audio
+// - Transcribes with OpenAI Whisper
+// - Rewrites into a tight presenter script (maxSeconds)
+// - Sends TEXT voice to HeyGen (with green background)
+// - Waits for webhook to set heygen_video_url + status=rendering
+// - Renders final composite (walkthrough background + keyed avatar overlay)
+// - Uploads final MP4 to Supabase + marks job completed
+
 import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import fs from "fs";
 import path from "path";
 import fetch from "node-fetch";
+import OpenAI from "openai";
 
 /* ==============================
    ENV + CONFIG
@@ -19,33 +30,70 @@ const supabase = createClient(
   mustEnv("SUPABASE_SERVICE_ROLE_KEY")
 );
 
-const BUCKET = process.env.STORAGE_BUCKET || "videos";
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const openai = new OpenAI({ apiKey: mustEnv("OPENAI_API_KEY") });
 
-console.log("🚀 WORKER LIVE");
+const BUCKET = process.env.STORAGE_BUCKET || "videos";
+const POLL_MS = Number(process.env.POLL_MS || 5000);
+
+// green key setup
+const GREEN_HEX = process.env.KEY_COLOR_HEX || "#00FF00";
+// ffmpeg colorkey expects hex without '#', in 0xRRGGBB format
+const GREEN_FFMPEG = "0x00FF00";
+
+// overlay placement
+const OVERLAY_SCALE_W = Number(process.env.OVERLAY_SCALE_W || 540); // avatar width on 1080 canvas
+const OVERLAY_MARGIN_X = Number(process.env.OVERLAY_MARGIN_X || 60);
+const OVERLAY_MARGIN_Y = Number(process.env.OVERLAY_MARGIN_Y || 100);
+
+// key tolerance (tune if edges look rough)
+const KEY_SIMILARITY = process.env.KEY_SIMILARITY || "0.35";
+const KEY_BLEND = process.env.KEY_BLEND || "0.20";
+
+// safety
+const MAX_WALK_DOWNLOAD_MB = Number(process.env.MAX_WALK_DOWNLOAD_MB || 250);
+
+console.log("🚀 WORKER LIVE (transcribe → rewrite → HeyGen → composite)");
 
 /* ==============================
-   DOWNLOAD FILE
+   UTIL: SLEEP
+============================== */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ==============================
+   UTIL: DOWNLOAD FILE (stream)
 ============================== */
 
-async function downloadToFile(url, outPath) {
-  const resp = await fetch(url);
+async function downloadToFile(url, outPath, { maxMB } = {}) {
+  if (!url || !url.startsWith("http")) {
+    throw new Error(`Invalid URL: ${url}`);
+  }
 
+  const resp = await fetch(url);
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`Download failed: ${resp.status} ${text}`);
   }
 
+  const maxBytes = (maxMB || 9999) * 1024 * 1024;
+  let downloaded = 0;
+
   await new Promise((resolve, reject) => {
     const stream = fs.createWriteStream(outPath);
-    resp.body.pipe(stream);
+    resp.body.on("data", (chunk) => {
+      downloaded += chunk.length;
+      if (downloaded > maxBytes) {
+        resp.body.destroy(new Error(`File too large (>${maxMB}MB)`));
+      }
+    });
     resp.body.on("error", reject);
+    stream.on("error", reject);
     stream.on("finish", resolve);
+    resp.body.pipe(stream);
   });
 }
 
 /* ==============================
-   RUN FFMPEG
+   UTIL: RUN FFMPEG
 ============================== */
 
 function runFFmpeg(args) {
@@ -63,12 +111,123 @@ function runFFmpeg(args) {
 }
 
 /* ==============================
-   CREATE HEYGEN VIDEO (TEXT MODE)
+   STEP: EXTRACT AUDIO
 ============================== */
 
-async function createHeygenVideo(scriptText) {
-  console.log("🎤 Sending script to HeyGen...");
+async function extractAudioMp4ToM4a(videoPath, audioOutPath) {
+  await runFFmpeg([
+    "-y",
+    "-i",
+    videoPath,
+    "-vn",
+    "-ac",
+    "1",
+    "-ar",
+    "44100",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    audioOutPath,
+  ]);
+}
+
+/* ==============================
+   STEP: TRANSCRIBE (OpenAI Whisper)
+============================== */
+
+async function transcribeAudio(audioPath) {
+  console.log("📝 Transcribing walkthrough audio…");
+
+  const result = await openai.audio.transcriptions.create({
+    model: "whisper-1",
+    file: fs.createReadStream(audioPath),
+  });
+
+  const text = (result?.text || "").trim();
+  if (!text) throw new Error("Transcription returned empty text");
+  return text;
+}
+
+/* ==============================
+   STEP: REWRITE SCRIPT (maxSeconds)
+============================== */
+
+function targetWordsForSeconds(maxSeconds) {
+  // presenter pace ~2.2–2.6 words/sec
+  const wps = 2.4;
+  return Math.max(30, Math.round(maxSeconds * wps));
+}
+
+async function rewriteToPresenterScript(transcript, maxSeconds = 30) {
+  const targetWords = targetWordsForSeconds(maxSeconds);
+
+  console.log(`✍️ Rewriting transcript → presenter script (~${maxSeconds}s, ~${targetWords} words)…`);
+
+  const resp = await openai.chat.completions.create({
+    model: process.env.OPENAI_SCRIPT_MODEL || "gpt-4o-mini",
+    temperature: 0.6,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a real estate video presenter. Write a concise spoken script for an avatar presenter. " +
+          "Sound natural, confident and clear. No bullet points. No headings. No emojis. " +
+          "Do not mention 'this video' or 'walkthrough'. Do not include addresses unless explicitly said. " +
+          "Keep it within the word target.",
+      },
+      {
+        role: "user",
+        content:
+          `WORD TARGET: ~${targetWords} words.\n` +
+          `MAX SECONDS: ${maxSeconds}\n\n` +
+          `TRANSCRIPT:\n${transcript}`,
+      },
+    ],
+  });
+
+  const script = (resp.choices?.[0]?.message?.content || "").trim();
+  if (!script) throw new Error("Script rewrite returned empty text");
+  return script;
+}
+
+/* ==============================
+   STEP: HEYGEN CREATE (TEXT VOICE)
+============================== */
+
+async function createHeygenVideoFromText({ scriptText, jobId }) {
+  console.log("🎤 Sending TEXT script to HeyGen:");
   console.log(scriptText);
+
+  // If you want HeyGen to call back your API webhook, set it inside the input.
+  // Your API webhook already updates status=rendering + heygen_video_url.
+  const callbackBase = mustEnv("HEYGEN_CALLBACK_BASE_URL"); // e.g. https://reelestate-api-9oob.onrender.com/heygen-callback
+  const callbackUrl =
+    `${callbackBase}?token=${encodeURIComponent(mustEnv("HEYGEN_WEBHOOK_SECRET"))}` +
+    `&job_id=${encodeURIComponent(jobId)}`;
+
+  const payload = {
+    video_inputs: [
+      {
+        character: {
+          type: "avatar",
+          avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
+        },
+        voice: {
+          type: "text",
+          voice_id: mustEnv("HEYGEN_VOICE_ID"),
+          // CRITICAL: HeyGen expects this exact key (per your error logs)
+          input_text: scriptText.trim(),
+        },
+        background: {
+          type: "color",
+          value: GREEN_HEX,
+        },
+        callback_url: callbackUrl,
+      },
+    ],
+    dimension: { width: 1080, height: 1920 },
+  };
 
   const resp = await fetch("https://api.heygen.com/v2/video/generate", {
     method: "POST",
@@ -76,138 +235,193 @@ async function createHeygenVideo(scriptText) {
       "Content-Type": "application/json",
       "X-Api-Key": mustEnv("HEYGEN_API_KEY"),
     },
-    body: JSON.stringify({
-      video_inputs: [
-        {
-          character: {
-            type: "avatar",
-            avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
-          },
-          voice: {
-            type: "text",
-            voice_id: mustEnv("HEYGEN_VOICE_ID"),
-            input_text: scriptText.trim(),
-          },
-          background: {
-            type: "color",
-            value: "#00FF00",
-          },
-        },
-      ],
-      dimension: {
-        width: 1080,
-        height: 1920,
-      },
-    }),
+    body: JSON.stringify(payload),
   });
 
-  const body = await resp.text();
-
+  const bodyText = await resp.text();
   if (!resp.ok) {
-    throw new Error(`HeyGen error: ${body}`);
+    throw new Error(`HeyGen error: ${bodyText}`);
   }
 
-  const json = JSON.parse(body);
+  const json = JSON.parse(bodyText);
   const videoId = json?.data?.video_id;
 
-  if (!videoId) throw new Error("No video_id returned");
+  if (!videoId) throw new Error("HeyGen did not return video_id");
 
   console.log("✅ HEYGEN VIDEO ID:", videoId);
   return videoId;
 }
 
 /* ==============================
-   PROCESS QUEUED JOB
+   STEP: UPLOAD FILE TO SUPABASE
+============================== */
+
+async function uploadToSupabase({ localPath, storagePath, contentType }) {
+  const buf = fs.readFileSync(localPath);
+
+  const { error } = await supabase.storage.from(BUCKET).upload(storagePath, buf, {
+    contentType,
+    upsert: true,
+  });
+  if (error) throw error;
+
+  const { data } = supabase.storage.from(BUCKET).getPublicUrl(storagePath);
+  return data.publicUrl;
+}
+
+/* ==============================
+   PHASE 1 — PROCESS QUEUED
 ============================== */
 
 async function processQueued(job) {
   const jobId = job.id;
+  const maxSeconds = Number(job.max_seconds || 30);
+
   console.log("📦 Processing QUEUED:", jobId);
+
+  // mark as processing (optional but helps avoid double-pickups)
+  await supabase
+    .from("render_jobs")
+    .update({ status: "processing" })
+    .eq("id", jobId);
 
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
+  const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
 
-  await downloadToFile(job.walkthrough_url, walkPath);
+  // 1) download walkthrough
+  await downloadToFile(job.walkthrough_url, walkPath, { maxMB: MAX_WALK_DOWNLOAD_MB });
 
-  // TEMP STATIC SCRIPT (replace later with GPT summary)
-  const scriptText = `
-Welcome to this stunning property.
-This beautifully presented home offers bright living spaces,
-modern finishes, and an exceptional location.
-Book your private viewing today.
-`;
+  // 2) extract audio
+  await extractAudioMp4ToM4a(walkPath, audioPath);
 
-  const videoId = await createHeygenVideo(scriptText);
+  // 3) transcribe audio
+  const transcript = await transcribeAudio(audioPath);
 
-  await supabase
-    .from("render_jobs")
-    .update({
-      status: "heygen_requested",
-      heygen_video_id: videoId,
-    })
-    .eq("id", jobId);
+  // 4) rewrite into presenter script (maxSeconds)
+  const scriptText = await rewriteToPresenterScript(transcript, maxSeconds);
 
-  console.log("📡 Waiting for HeyGen webhook...");
+  // 5) create HeyGen video (text voice)
+  const heygenVideoId = await createHeygenVideoFromText({ scriptText, jobId });
+
+  // store transcript + script (optional columns; safe if they don't exist? -> will error)
+  // If you don't have these columns, delete these fields.
+  const updatePayload = {
+    status: "heygen_requested",
+    heygen_video_id: heygenVideoId,
+    // optional debug fields (remove if your table doesn't include them)
+    transcript_text: transcript,
+    script_text: scriptText,
+  };
+
+  // Try update; if your table doesn't have transcript_text/script_text, retry without them.
+  const upd1 = await supabase.from("render_jobs").update(updatePayload).eq("id", jobId);
+  if (upd1.error) {
+    console.log("⚠️ Could not save transcript/script fields, retrying without them:", upd1.error.message);
+    const upd2 = await supabase
+      .from("render_jobs")
+      .update({
+        status: "heygen_requested",
+        heygen_video_id: heygenVideoId,
+      })
+      .eq("id", jobId);
+    if (upd2.error) throw upd2.error;
+  }
+
+  console.log("📡 HeyGen requested. Waiting for webhook to set status=rendering…");
 }
 
 /* ==============================
-   PROCESS RENDERING JOB
+   PHASE 2 — PROCESS RENDERING
 ============================== */
 
 async function processRendering(job) {
   const jobId = job.id;
   console.log("🎬 Rendering FINAL:", jobId);
 
+  // lock it
+  await supabase
+    .from("render_jobs")
+    .update({ status: "rendering_in_progress" })
+    .eq("id", jobId);
+
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
   const avatarPath = path.join(tmp, `avatar-${jobId}.mp4`);
   const finalPath = path.join(tmp, `final-${jobId}.mp4`);
 
-  await downloadToFile(job.walkthrough_url, walkPath);
-  await downloadToFile(job.heygen_video_url, avatarPath);
+  await downloadToFile(job.walkthrough_url, walkPath, { maxMB: MAX_WALK_DOWNLOAD_MB });
+  await downloadToFile(job.heygen_video_url, avatarPath, { maxMB: 500 });
+
+  // Composite:
+  // - background = walkthrough scaled/cropped to 1080x1920
+  // - avatar = scaled to fixed width, key out green, overlay bottom-right-ish
+  const filter =
+    `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[vbg];` +
+    `[1:v]scale=${OVERLAY_SCALE_W}:-2,colorkey=${GREEN_FFMPEG}:${KEY_SIMILARITY}:${KEY_BLEND}[fg];` +
+    `[vbg][fg]overlay=W-w-${OVERLAY_MARGIN_X}:H-h-${OVERLAY_MARGIN_Y}[outv]`;
 
   await runFFmpeg([
     "-y",
-    "-i", walkPath,
-    "-i", avatarPath,
+    "-i",
+    walkPath,
+    "-i",
+    avatarPath,
     "-filter_complex",
-    "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[vbg];" +
-    "[1:v]scale=540:-2,colorkey=0x00FF00:0.35:0.2[fg];" +
-    "[vbg][fg]overlay=W-w-60:H-h-100[outv]",
-    "-map", "[outv]",
-    "-map", "1:a",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "28",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
+    filter,
+    "-map",
+    "[outv]",
+    "-map",
+    "1:a?", // keep HeyGen audio
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "160k",
     finalPath,
   ]);
 
-  const buffer = fs.readFileSync(finalPath);
-  const storagePath = `renders/final-${jobId}.mp4`;
+  const finalPublicUrl = await uploadToSupabase({
+    localPath: finalPath,
+    storagePath: `renders/final-${jobId}.mp4`,
+    contentType: "video/mp4",
+  });
 
-  const { error } = await supabase.storage
-    .from(BUCKET)
-    .upload(storagePath, buffer, {
-      contentType: "video/mp4",
-      upsert: true,
-    });
+  const upd = await supabase
+    .from("render_jobs")
+    .update({
+      status: "completed",
+      final_public_url: finalPublicUrl,
+    })
+    .eq("id", jobId);
 
-  if (error) throw error;
+  if (upd.error) throw upd.error;
 
-  const { data: pub } =
-    supabase.storage.from(BUCKET).getPublicUrl(storagePath);
+  console.log("✅ Completed:", jobId, finalPublicUrl);
+}
+
+/* ==============================
+   ERROR HANDLER
+============================== */
+
+async function failJob(jobId, err) {
+  const msg = String(err?.message || err || "Unknown error");
+  console.error("❌ Job failed:", jobId, msg);
 
   await supabase
     .from("render_jobs")
     .update({
-      status: "completed",
-      final_public_url: pub.publicUrl,
+      status: "failed",
+      error: msg.slice(0, 2000),
     })
     .eq("id", jobId);
-
-  console.log("✅ Completed:", jobId);
 }
 
 /* ==============================
@@ -216,33 +430,51 @@ async function processRendering(job) {
 
 async function loop() {
   while (true) {
+    // 1) queued → processing → heygen_requested
     try {
-      const { data: queued } = await supabase
+      const { data: queued, error: qErr } = await supabase
         .from("render_jobs")
         .select("*")
         .eq("status", "queued")
+        .order("created_at", { ascending: true })
         .limit(1);
 
+      if (qErr) throw qErr;
+
       if (queued?.length) {
-        await processQueued(queued[0]);
+        const job = queued[0];
+        try {
+          await processQueued(job);
+        } catch (err) {
+          await failJob(job.id, err);
+        }
+        await sleep(POLL_MS);
         continue;
       }
 
-      const { data: rendering } = await supabase
+      // 2) rendering → rendering_in_progress → completed
+      const { data: rendering, error: rErr } = await supabase
         .from("render_jobs")
         .select("*")
         .eq("status", "rendering")
+        .order("created_at", { ascending: true })
         .limit(1);
 
-      if (rendering?.length) {
-        await processRendering(rendering[0]);
-      }
+      if (rErr) throw rErr;
 
+      if (rendering?.length) {
+        const job = rendering[0];
+        try {
+          await processRendering(job);
+        } catch (err) {
+          await failJob(job.id, err);
+        }
+      }
     } catch (err) {
-      console.error("❌ Worker error:", err);
+      console.error("❌ Worker loop error:", err);
     }
 
-    await sleep(5000);
+    await sleep(POLL_MS);
   }
 }
 
