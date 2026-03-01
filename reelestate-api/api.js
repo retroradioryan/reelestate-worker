@@ -1,5 +1,6 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
+console.log("🔥 NEW API VERSION LOADED");
 
 const app = express();
 app.use(express.json());
