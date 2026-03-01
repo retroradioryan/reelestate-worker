@@ -22,7 +22,7 @@ const supabase = createClient(
 const BUCKET = process.env.STORAGE_BUCKET || "videos";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-console.log("🔥 NEW WORKER VERSION LOADED 🔥");
+console.log("🔥 WORKER VERSION 100% CLEAN 🔥");
 
 /* ==============================
    DOWNLOAD FILE
@@ -84,8 +84,11 @@ async function createHeygenVideo(scriptText) {
               type: "avatar",
               avatar_id: mustEnv("HEYGEN_AVATAR_ID"),
             },
-            input_text: scriptText.trim(),
-            voice_id: mustEnv("HEYGEN_VOICE_ID"),
+            voice: {
+              type: "text",
+              voice_id: mustEnv("HEYGEN_VOICE_ID"),
+              input_text: scriptText.trim(),
+            },
             background: {
               type: "color",
               value: "#00FF00",
@@ -128,7 +131,7 @@ async function processQueued(job) {
 
   await downloadToFile(job.walkthrough_url, walkPath);
 
-  // TEMP SCRIPT (Replace later with GPT summary)
+  // TEMP STATIC SCRIPT (replace later with GPT summary)
   const scriptText = `
 Welcome to this stunning property.
 This beautifully presented home offers bright living spaces,
