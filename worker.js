@@ -1,6 +1,8 @@
-// worker.js (STABLE VERSION — Callback + Debug + Production Safe)
+// worker.js (FULL PRODUCTION VERSION — QUEUED + RENDERING SUPPORT)
 
 import { createClient } from "@supabase/supabase-js";
+import fs from "fs";
+import path from "path";
 
 /* ==============================
    ENV VALIDATION
@@ -27,7 +29,7 @@ const HEYGEN_VOICE_ID = mustEnv("HEYGEN_VOICE_ID");
 const POLL_MS = 5000;
 
 /* ==============================
-   CLIENTS
+   CLIENT
 ============================== */
 
 const supabase = createClient(
@@ -36,8 +38,6 @@ const supabase = createClient(
 );
 
 console.log("🚀 WORKER LIVE");
-console.log("Callback Base:", HEYGEN_CALLBACK_BASE_URL);
-console.log("Webhook Secret:", HEYGEN_WEBHOOK_SECRET);
 
 /* ==============================
    UTIL
@@ -61,6 +61,17 @@ async function fetchJSON(url, options = {}) {
   }
 }
 
+async function downloadFile(url, outputPath) {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Download failed: ${response.status}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
+}
+
 /* ==============================
    CREATE HEYGEN VIDEO
 ============================== */
@@ -71,11 +82,8 @@ async function createHeygenVideo({ scriptText, jobId }) {
     `?token=${encodeURIComponent(HEYGEN_WEBHOOK_SECRET)}` +
     `&job_id=${encodeURIComponent(jobId)}`;
 
-  console.log("=================================");
-  console.log("🎬 Creating HeyGen Video");
-  console.log("Job ID:", jobId);
+  console.log("🎬 Creating HeyGen video for job:", jobId);
   console.log("Callback URL:", callbackUrl);
-  console.log("=================================");
 
   const payload = {
     video_inputs: [
@@ -95,15 +103,9 @@ async function createHeygenVideo({ scriptText, jobId }) {
         },
       },
     ],
-    dimension: {
-      width: 1080,
-      height: 1920,
-    },
-    callback_url: callbackUrl, // must be ROOT LEVEL
+    dimension: { width: 1080, height: 1920 },
+    callback_url: callbackUrl,
   };
-
-  console.log("Sending payload to HeyGen...");
-  console.log(JSON.stringify(payload, null, 2));
 
   const json = await fetchJSON(
     "https://api.heygen.com/v2/video/generate",
@@ -117,8 +119,6 @@ async function createHeygenVideo({ scriptText, jobId }) {
     }
   );
 
-  console.log("HeyGen response:", JSON.stringify(json, null, 2));
-
   const videoId = json?.data?.video_id;
 
   if (!videoId) {
@@ -131,15 +131,14 @@ async function createHeygenVideo({ scriptText, jobId }) {
 }
 
 /* ==============================
-   PROCESS QUEUED JOB
+   PROCESS QUEUED
 ============================== */
 
-async function processQueuedJob(job) {
+async function processQueued(job) {
   const jobId = job.id;
 
-  console.log("📦 Processing job:", jobId);
+  console.log("📦 Processing QUEUED job:", jobId);
 
-  // Minimal script for stability
   const script =
     "Welcome to this beautiful new listing. Contact us today to arrange your private viewing.";
 
@@ -156,7 +155,37 @@ async function processQueuedJob(job) {
     })
     .eq("id", jobId);
 
-  console.log("⏳ Waiting for webhook...");
+  console.log("⏳ Waiting for webhook to switch to rendering...");
+}
+
+/* ==============================
+   PROCESS RENDERING
+============================== */
+
+async function processRendering(job) {
+  const jobId = job.id;
+
+  console.log("🎞 Processing RENDERING job:", jobId);
+
+  if (!job.heygen_video_url) {
+    console.log("⚠️ No video URL yet.");
+    return;
+  }
+
+  const tmpPath = path.join("/tmp", `heygen-${jobId}.mp4`);
+
+  await downloadFile(job.heygen_video_url, tmpPath);
+
+  // For now: just mark completed
+  await supabase
+    .from("render_jobs")
+    .update({
+      status: "completed",
+      final_public_url: job.heygen_video_url,
+    })
+    .eq("id", jobId);
+
+  console.log("✅ Job completed:", jobId);
 }
 
 /* ==============================
@@ -166,18 +195,28 @@ async function processQueuedJob(job) {
 async function loop() {
   while (true) {
     try {
-      const { data, error } = await supabase
+      // 1️⃣ Check queued
+      const { data: queued } = await supabase
         .from("render_jobs")
         .select("*")
         .eq("status", "queued")
         .limit(1);
 
-      if (error) {
-        console.error("Supabase error:", error.message);
+      if (queued?.length) {
+        await processQueued(queued[0]);
+        await sleep(POLL_MS);
+        continue;
       }
 
-      if (data && data.length > 0) {
-        await processQueuedJob(data[0]);
+      // 2️⃣ Check rendering
+      const { data: rendering } = await supabase
+        .from("render_jobs")
+        .select("*")
+        .eq("status", "rendering")
+        .limit(1);
+
+      if (rendering?.length) {
+        await processRendering(rendering[0]);
       }
     } catch (err) {
       console.error("Worker error:", err.message);
