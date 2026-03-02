@@ -1,23 +1,22 @@
-// worker.js (PRODUCTION — FULL TRANSCRIBE (<=5min) → 2min MONTAGE PLAN → HeyGen → Montage Composite + Logo + Lower Third + Email)
+// worker.js (PRODUCTION — FULL TRANSCRIBE (<=5min) → SYNCED MONTAGE (max_seconds) → HeyGen → Composite + Logo + Lower Third + Email)
+//
+// ✅ Uses EXISTING DB columns ONLY:
+// - transcript_text: full Whisper transcript
+// - script_text: JSON string containing montage plan + final narration script
+// - max_seconds: desired final length (default 120)
+// - logo_url: optional per-job logo (falls back to env LOGO_URL)
+// - final_public_url: output link
+//
+// Montage sync approach:
+// 1) Whisper full transcript with timestamps (<=5 mins cap)
+// 2) GPT builds montage plan: [{start,end,line}] where total duration ≈ targetSeconds
+// 3) GPT also returns combined "script" (lines joined naturally)
+// 4) Worker cuts & concatenates those windows into a montage background
+// 5) HeyGen narrates the montage script
+// 6) Composite avatar over montage with lower third + logo
+//
 // Pipeline:
 // queued -> processing -> heygen_requested -> (webhook sets rendering + heygen_video_url) -> rendering_in_progress -> completed
-//
-// ✅ This version does TRUE SYNC via a montage:
-// - Whisper transcribes the FULL walkthrough (<= 5 minutes cap)
-// - GPT outputs a montage plan: multiple time windows totaling ~120s + narration line per window
-// - Worker builds montage by trimming + concatenating those windows
-// - HeyGen voice narrates the montage (audio aligns with chosen windows)
-// - Final output hard-capped to 120 seconds
-//
-// NO DB CHANGES:
-// - montage plan stored inside existing render_jobs.script_text as JSON string
-// - transcript_text stored as plain text (if your column exists)
-//
-// ENV (required): same as your current
-// ENV (new optional):
-// MAX_FINAL_SECONDS=120            (default 120 for 2 mins)
-// MAX_TRANSCRIBE_SECONDS=300       (default 5 mins)
-// MAX_SEGMENTS_TO_SEND=450         (limit Whisper segments passed to GPT)
 
 import { createClient } from "@supabase/supabase-js";
 import { spawn } from "child_process";
@@ -58,10 +57,13 @@ const FROM_EMAIL = mustEnv("FROM_EMAIL");
 const STORAGE_BUCKET = process.env.STORAGE_BUCKET || "videos";
 const POLL_MS = Number(process.env.POLL_MS || 5000);
 
-// Caps
-const MAX_FINAL_SECONDS = Number(process.env.MAX_FINAL_SECONDS || 120); // ✅ 2 minutes
-const MAX_TRANSCRIBE_SECONDS = Number(process.env.MAX_TRANSCRIBE_SECONDS || 300); // ✅ 5 minutes cap
+// Cost control
+const MAX_TRANSCRIBE_SECONDS = Number(process.env.MAX_TRANSCRIBE_SECONDS || 300); // 5 mins max
 const MAX_SEGMENTS_TO_SEND = Number(process.env.MAX_SEGMENTS_TO_SEND || 450);
+
+// Output defaults
+const DEFAULT_TARGET_SECONDS = Number(process.env.DEFAULT_TARGET_SECONDS || 120); // 2 minutes default
+const MAX_TARGET_SECONDS = Number(process.env.MAX_TARGET_SECONDS || 180); // clamp user input (optional safety)
 
 // Keying
 const KEY_COLOR_HEX = process.env.KEY_COLOR_HEX || "#00FF00";
@@ -76,13 +78,14 @@ const AVATAR_MARGIN_Y = Number(process.env.AVATAR_MARGIN_Y || 10);
 const AVATAR_OPACITY = Number(process.env.AVATAR_OPACITY || 0.92);
 const EDGE_SOFTEN = String(process.env.EDGE_SOFTEN || "1");
 
+// Lower third
 const LT_TEXT = process.env.LT_TEXT || "Brand New Listing";
 const LT_BAR_Y = Number(process.env.LT_BAR_Y || 1660);
 const LT_BAR_H = Number(process.env.LT_BAR_H || 240);
 const LT_BAR_ALPHA = Number(process.env.LT_BAR_ALPHA || 0.55);
 
-// Static logo (top-right)
-const LOGO_URL =
+// Default logo (can be overridden per job by render_jobs.logo_url)
+const DEFAULT_LOGO_URL =
   process.env.LOGO_URL ||
   "https://mzoygebnoenwlxbjbrdb.supabase.co/storage/v1/object/public/logos/reelestate-logo.png";
 const LOGO_W = Number(process.env.LOGO_W || 210);
@@ -102,7 +105,11 @@ const resend = new Resend(RESEND_API_KEY);
 
 console.log("🚀 WORKER LIVE");
 console.log("Polling every", POLL_MS, "ms");
-console.log("Caps:", { MAX_FINAL_SECONDS, MAX_TRANSCRIBE_SECONDS });
+console.log("Limits:", {
+  MAX_TRANSCRIBE_SECONDS,
+  DEFAULT_TARGET_SECONDS,
+  MAX_TARGET_SECONDS,
+});
 
 /* ==============================
    UTILS
@@ -119,12 +126,22 @@ function safeUnlink(p) {
   } catch {}
 }
 
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", args);
     ff.stderr.on("data", (d) => console.log(d.toString()));
     ff.on("error", reject);
-    ff.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`FFmpeg failed (${code})`))));
+    ff.on("close", (code) =>
+      code === 0 ? resolve() : reject(new Error(`FFmpeg failed (${code})`))
+    );
   });
 }
 
@@ -205,7 +222,7 @@ async function sendFinalEmail(to, url, jobId) {
 }
 
 /* ==============================
-   AUDIO → WHISPER → MONTAGE PLAN (segments + lines) → stitched script
+   AUDIO → WHISPER → MONTAGE PLAN
 ============================== */
 async function extractAudioToM4a(videoPath, audioOutPath) {
   await runFFmpeg([
@@ -227,38 +244,30 @@ async function extractAudioToM4a(videoPath, audioOutPath) {
 
 function estimateWordTarget(seconds) {
   // ~2.4 words/sec
-  return Math.max(80, Math.round(seconds * 2.4));
+  return Math.max(60, Math.round(seconds * 2.4));
 }
 
-function safeJsonParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
-}
-
-// Build a montage mp4 from the original walkthrough and an array of segments
-// segments: [{start, end}]
-async function buildMontageVideo(inWalkPath, outMontagePath, segments) {
-  if (!segments?.length) {
-    // fallback: first MAX_FINAL_SECONDS
+/**
+ * Build montage video: trims each segment and concatenates (video only).
+ * segments: [{start:number,end:number}]
+ */
+async function buildMontageVideo(inWalkPath, outMontagePath, segments, targetSeconds) {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    // fallback: first targetSeconds
     await runFFmpeg([
       "-y",
       "-i",
       inWalkPath,
       "-t",
-      String(MAX_FINAL_SECONDS),
+      String(targetSeconds),
       "-c:v",
       "libx264",
       "-preset",
       "veryfast",
       "-crf",
       "23",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
+      "-pix_fmt",
+      "yuv420p",
       "-movflags",
       "+faststart",
       outMontagePath,
@@ -266,14 +275,11 @@ async function buildMontageVideo(inWalkPath, outMontagePath, segments) {
     return;
   }
 
-  // Create filter_complex that trims each segment and concatenates
   const parts = [];
   for (let i = 0; i < segments.length; i++) {
     const s = Math.max(0, Number(segments[i].start || 0));
     const e = Math.max(s, Number(segments[i].end || s));
-    parts.push(
-      `[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS[v${i}]`
-    );
+    parts.push(`[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS[v${i}]`);
   }
 
   const concatInputs = segments.map((_, i) => `[v${i}]`).join("");
@@ -288,7 +294,7 @@ async function buildMontageVideo(inWalkPath, outMontagePath, segments) {
     "-map",
     "[vout]",
     "-t",
-    String(MAX_FINAL_SECONDS),
+    String(targetSeconds),
     "-c:v",
     "libx264",
     "-preset",
@@ -303,7 +309,7 @@ async function buildMontageVideo(inWalkPath, outMontagePath, segments) {
   ]);
 }
 
-async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
+async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId, targetSeconds) {
   const tmp = "/tmp";
   const videoPath = path.join(tmp, `walk-${jobId}.mp4`);
   const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
@@ -311,7 +317,7 @@ async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
   try {
     await downloadFile(walkthroughUrl, videoPath);
 
-    // ✅ enforce Whisper max duration (5 mins)
+    // cost control: reject > 5 min
     const duration = await getVideoDurationSeconds(videoPath);
     if (duration && duration > MAX_TRANSCRIBE_SECONDS) {
       throw new Error(
@@ -330,21 +336,19 @@ async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
     });
 
     const transcript = String(transcriptRes?.text || "").trim();
-    const segments = Array.isArray(transcriptRes?.segments) ? transcriptRes.segments : [];
+    const segs = Array.isArray(transcriptRes?.segments) ? transcriptRes.segments : [];
 
     if (!transcript) throw new Error("Empty transcript from Whisper");
 
-    // Token-safe payload
-    const timed = segments.slice(0, MAX_SEGMENTS_TO_SEND).map((s) => ({
+    const timed = segs.slice(0, MAX_SEGMENTS_TO_SEND).map((s) => ({
       start: Number(s.start || 0),
       end: Number(s.end || 0),
       text: String(s.text || "").trim(),
     }));
 
-    const targetSeconds = MAX_FINAL_SECONDS;
     const wordTarget = estimateWordTarget(targetSeconds);
 
-    console.log("✍️ GPT building montage plan (windows + narration per window) …");
+    console.log("✍️ GPT building montage plan …");
 
     const planRes = await openai.chat.completions.create({
       model: process.env.OPENAI_SCRIPT_MODEL || "gpt-4o-mini",
@@ -354,20 +358,20 @@ async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
           role: "system",
           content:
             "You are a senior video editor for real-estate walk-throughs. " +
-            "Your job: create a tightly synced montage and narration.\n\n" +
-            "Return ONLY valid JSON with shape:\n" +
+            "Create a montage plan that stays synced with narration.\n\n" +
+            "Return ONLY valid JSON:\n" +
             "{\n" +
             '  "segments": [ { "start": number, "end": number, "line": string } ],\n' +
             '  "script": string\n' +
             "}\n\n" +
-            "Rules:\n" +
-            `- Total montage duration (sum of end-start) should be ~${targetSeconds} seconds (±3s).\n` +
-            "- Segments must be chronological (increasing time), and each segment must be 6–25 seconds.\n" +
-            "- The 'line' must describe what is being shown during THAT segment (kitchen, bedroom, garden, etc.).\n" +
-            "- The combined 'script' should be the lines joined into one natural narration.\n" +
-            "- Script style: confident agent voice, no bullets/headings/emojis/stage directions. " +
-            "Do NOT say 'walkthrough', 'recording', or 'this video'. End with a viewing call-to-action.\n" +
-            `- Keep narration length around ${wordTarget} words total.\n`,
+            `Rules:\n- Total duration (sum of end-start) ≈ ${targetSeconds} seconds (±3s).\n` +
+            "- Segments MUST be chronological.\n" +
+            "- Each segment 6–25 seconds.\n" +
+            "- Each segment 'line' MUST describe what is being shown in that window.\n" +
+            "- 'script' should be a natural narration built from the lines.\n" +
+            "- Style: confident agent voice, no bullets/headings/emojis/stage directions. " +
+            "Do NOT say 'walkthrough', 'recording', or 'this video'. End with a call-to-action.\n" +
+            `- Keep the full narration around ${wordTarget} words.\n`,
         },
         {
           role: "user",
@@ -383,8 +387,7 @@ async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
     const json = safeJsonParse(raw);
 
     if (!json?.segments?.length) {
-      // fallback: first window + summarize
-      console.log("⚠️ Montage plan JSON invalid; falling back to single segment.");
+      console.log("⚠️ Montage plan invalid JSON; fallback to first segment.");
       return {
         transcript,
         plan: {
@@ -394,16 +397,19 @@ async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
       };
     }
 
-    // Validate + clamp segments to video duration
-    const maxT = duration || (segments.length ? Number(segments[segments.length - 1].end || 0) : null);
+    const maxT =
+      duration ||
+      (segs.length ? Number(segs[segs.length - 1]?.end || 0) : null) ||
+      null;
+
     let cleaned = [];
     let sum = 0;
+    let lastStart = -1;
 
     for (const seg of json.segments) {
       let s = Number(seg.start || 0);
       let e = Number(seg.end || 0);
-      if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
-      if (e <= s) continue;
+      if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) continue;
 
       if (maxT && maxT > 0) {
         s = clamp(s, 0, maxT);
@@ -414,30 +420,36 @@ async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
         e = Math.max(s, e);
       }
 
-      const durSeg = e - s;
-      if (durSeg < 4 || durSeg > 35) continue; // keep reasonable
+      if (s <= lastStart) continue; // enforce chronological
+      lastStart = s;
 
-      cleaned.push({ start: s, end: e, line: String(seg.line || "").trim() });
-      sum += durSeg;
-      if (sum >= targetSeconds + 3) break;
+      const d = e - s;
+      if (d < 6 || d > 25) continue;
+
+      cleaned.push({
+        start: s,
+        end: e,
+        line: String(seg.line || "").trim(),
+      });
+
+      sum += d;
+      if (sum >= targetSeconds - 2) break;
     }
 
     if (!cleaned.length) {
       cleaned = [{ start: 0, end: targetSeconds, line: "" }];
     }
 
-    // Force total cap
     const script =
       String(json.script || "").trim() ||
-      cleaned.map((s) => s.line).filter(Boolean).join(" ").trim();
+      cleaned.map((x) => x.line).filter(Boolean).join(" ").trim();
 
-    return {
-      transcript,
-      plan: {
-        segments: cleaned,
-        script,
-      },
-    };
+    if (!script) {
+      // last resort: create minimal script
+      return { transcript, plan: { segments: cleaned, script: "A quick highlight tour of this property—get in touch to book a viewing." } };
+    }
+
+    return { transcript, plan: { segments: cleaned, script } };
   } finally {
     safeUnlink(videoPath);
     safeUnlink(audioPath);
@@ -445,7 +457,7 @@ async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
 }
 
 /* ==============================
-   HEYGEN: CREATE VIDEO
+   HEYGEN
 ============================== */
 async function createHeygenVideo({ scriptText, jobId, avatarId, voiceId }) {
   const callbackUrl =
@@ -505,20 +517,15 @@ async function failJob(jobId, err) {
   const msg = String(err?.message || err || "Unknown error");
   console.error("❌ Job failed:", jobId, msg);
 
-  await supabase
-    .from("render_jobs")
-    .update({ status: "failed", error: msg.slice(0, 2000) })
-    .eq("id", jobId);
+  await supabase.from("render_jobs").update({ status: "failed", error: msg.slice(0, 2000) }).eq("id", jobId);
 }
 
 /* ==============================
    PHASE 1 — queued -> heygen_requested
-   Store montage plan INSIDE script_text as JSON string (no DB changes)
 ============================== */
 async function processQueued(job) {
   const jobId = job.id;
 
-  // Lock job
   const { data: locked, error: lockErr } = await supabase
     .from("render_jobs")
     .update({ status: "processing" })
@@ -532,10 +539,15 @@ async function processQueued(job) {
 
   console.log("📦 Processing QUEUED job:", jobId);
 
+  // Target seconds from job.max_seconds (default 120). Clamp to protect costs/UX.
+  let targetSeconds = Number(locked.max_seconds || DEFAULT_TARGET_SECONDS);
+  if (!Number.isFinite(targetSeconds) || targetSeconds <= 0) targetSeconds = DEFAULT_TARGET_SECONDS;
+  targetSeconds = clamp(targetSeconds, 20, MAX_TARGET_SECONDS);
+
   let avatarId = null;
   let voiceId = null;
 
-  // 1️⃣ Resolve avatar from avatars table
+  // Resolve avatar from avatars table if present, else fallback to env
   if (locked.avatar_id) {
     const { data: avatar, error: avatarErr } = await supabase
       .from("avatars")
@@ -547,7 +559,7 @@ async function processQueued(job) {
     avatarId = avatar.provider_avatar_id;
   }
 
-  // 2️⃣ Resolve voice from voices table
+  // Resolve voice from voices table if present, else fallback to env
   if (locked.voice_id) {
     const { data: voice, error: voiceErr } = await supabase
       .from("voices")
@@ -559,7 +571,6 @@ async function processQueued(job) {
     voiceId = voice.provider_voice_id;
   }
 
-  // 3️⃣ Fallback env logic
   if (!avatarId || !voiceId) {
     console.log("⚠️ Falling back to legacy avatar_type logic");
     const avatarType = String(locked.avatar_type || "female").toLowerCase();
@@ -568,33 +579,26 @@ async function processQueued(job) {
     voiceId = isMale ? HEYGEN_VOICE_ID_MALE : HEYGEN_VOICE_ID_FEMALE;
   }
 
-  // FULL transcribe -> montage plan (segments + synced narration)
+  // Full transcribe (<=5min) -> montage plan for targetSeconds
   const { transcript, plan } = await generateMontagePlanFromWalkthrough(
     locked.walkthrough_url,
-    jobId
+    jobId,
+    targetSeconds
   );
 
-  // Script must exist; if GPT returned empty, derive from lines
-  const script =
-    String(plan.script || "").trim() ||
-    plan.segments.map((s) => s.line).filter(Boolean).join(" ").trim();
+  // Pack plan JSON into script_text
+  const packed = JSON.stringify({
+    targetSeconds,
+    script: plan.script,
+    segments: plan.segments, // [{start,end,line}]
+  });
 
-  if (!script) {
-    throw new Error("Montage narration script is empty (GPT output).");
-  }
-
-  // Generate HeyGen avatar video
+  // Create HeyGen avatar video from plan.script
   const heygenVideoId = await createHeygenVideo({
-    scriptText: script,
+    scriptText: plan.script,
     jobId,
     avatarId,
     voiceId,
-  });
-
-  // Store montage plan as JSON in script_text (NO DB CHANGES)
-  const packed = JSON.stringify({
-    script,
-    segments: plan.segments, // [{start,end,line}]
   });
 
   const { error: updErr } = await supabase
@@ -602,8 +606,9 @@ async function processQueued(job) {
     .update({
       status: "heygen_requested",
       heygen_video_id: heygenVideoId,
-      transcript_text: transcript, // if your column exists
-      script_text: packed,         // JSON string containing montage plan
+      transcript_text: transcript,
+      script_text: packed,         // montage plan stored here
+      max_seconds: targetSeconds,  // normalize saved value
     })
     .eq("id", jobId);
 
@@ -614,11 +619,6 @@ async function processQueued(job) {
 
 /* ==============================
    PHASE 2 — rendering -> completed
-   Composite:
-   - Background: montage built from stored segments (script_text JSON)
-   - Avatar: colorkey + soften + opacity
-   - Lower third + Logo
-   - Audio: HeyGen audio
 ============================== */
 function escapeDrawtext(s) {
   return String(s || "")
@@ -630,7 +630,6 @@ function escapeDrawtext(s) {
 async function processRendering(job) {
   const jobId = job.id;
 
-  // Lock rendering job
   const { data: locked, error: lockErr } = await supabase
     .from("render_jobs")
     .update({ status: "rendering_in_progress" })
@@ -660,26 +659,28 @@ async function processRendering(job) {
   try {
     await downloadFile(locked.walkthrough_url, walkPath);
     await downloadFile(locked.heygen_video_url, avatarPath);
-    await downloadFile(LOGO_URL, logoPath);
 
-    // Parse montage plan from script_text JSON
-    let montagePlan = null;
-    if (locked.script_text) {
-      montagePlan = safeJsonParse(String(locked.script_text));
-    }
+    const logoUrl = (locked.logo_url || DEFAULT_LOGO_URL).trim();
+    await downloadFile(logoUrl, logoPath);
 
-    const segments = Array.isArray(montagePlan?.segments) ? montagePlan.segments : null;
+    // Parse montage plan from script_text
+    const packed = safeJsonParse(String(locked.script_text || ""));
+    const targetSeconds = clamp(
+      Number(packed?.targetSeconds || locked.max_seconds || DEFAULT_TARGET_SECONDS),
+      20,
+      MAX_TARGET_SECONDS
+    );
 
-    // Build montage background video
-    await buildMontageVideo(walkPath, montagePath, segments);
+    const segments = Array.isArray(packed?.segments) ? packed.segments : [];
+
+    // Build montage background
+    await buildMontageVideo(walkPath, montagePath, segments, targetSeconds);
 
     const headline = (locked.property_headline || LT_TEXT || "Brand New Listing").trim();
     const safeLT = escapeDrawtext(headline);
 
     const soften =
-      EDGE_SOFTEN && Number(EDGE_SOFTEN) > 0
-        ? `,boxblur=${EDGE_SOFTEN}:${EDGE_SOFTEN}`
-        : "";
+      EDGE_SOFTEN && Number(EDGE_SOFTEN) > 0 ? `,boxblur=${EDGE_SOFTEN}:${EDGE_SOFTEN}` : "";
 
     const filter =
       `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
@@ -697,7 +698,7 @@ async function processRendering(job) {
     await runFFmpeg([
       "-y",
       "-i",
-      montagePath, // ✅ montage background
+      montagePath,
       "-i",
       avatarPath,
       "-i",
@@ -707,10 +708,10 @@ async function processRendering(job) {
       "-map",
       "[outv]",
       "-map",
-      "1:a?",
+      "1:a?", // HeyGen audio
       "-shortest",
       "-t",
-      String(MAX_FINAL_SECONDS), // ✅ hard cap final duration
+      String(targetSeconds),
       "-c:v",
       "libx264",
       "-preset",
@@ -735,6 +736,7 @@ async function processRendering(job) {
       .from("render_jobs")
       .update({
         status: "completed",
+        final_storage_path: storagePath,
         final_public_url: publicUrl,
       })
       .eq("id", jobId);
@@ -762,7 +764,7 @@ async function processRendering(job) {
 async function loop() {
   while (true) {
     try {
-      // 1) queued
+      // queued
       const { data: queued, error: qErr } = await supabase
         .from("render_jobs")
         .select("*")
@@ -783,7 +785,7 @@ async function loop() {
         continue;
       }
 
-      // 2) rendering
+      // rendering
       const { data: rendering, error: rErr } = await supabase
         .from("render_jobs")
         .select("*")
