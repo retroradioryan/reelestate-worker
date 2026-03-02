@@ -485,7 +485,8 @@ async function processRendering(job) {
     await downloadFile(locked.heygen_video_url, avatarPath);
     await downloadFile(LOGO_URL, logoPath);
 
-    const safeLT = escapeDrawtext(LT_TEXT);
+    const headline = (locked.property_headline || LT_TEXT || "Brand New Listing").trim();
+const safeLT = escapeDrawtext(headline);
 
     // Slight edge soften optional
     const soften =
@@ -514,7 +515,7 @@ async function processRendering(job) {
       `colorchannelmixer=aa=${AVATAR_OPACITY}[av];` +
 
       // overlay avatar bottom-right
-      `[vbg][av]overlay=x=W-w-${AVATAR_MARGIN_X}:y=H-h-${AVATAR_MARGIN_Y}[v1];` +
+      `[vbg][av]overlay=x=W-w-${AVATAR_MARGIN_X}:y=${LT_BAR_Y}-h-30[v1];` +
 
       // logo top-right (keep it crisp)
       `[2:v]scale=${LOGO_W}:-1,format=rgba[lg];` +
