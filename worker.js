@@ -18,6 +18,8 @@
 // Pipeline:
 // queued -> processing -> heygen_requested -> (webhook sets rendering + heygen_video_url) -> rendering_in_progress -> completed
 
+console.log("🚀 WORKER LIVE - VERSION 4");
+
 console.log("HEYGEN_API_KEY exists?", Boolean(process.env.HEYGEN_API_KEY));
 console.log("HEYGEN_API_KEY length:", process.env.HEYGEN_API_KEY?.length);
 
@@ -311,7 +313,24 @@ async function simpleTrimFallback(inWalkPath, outMontagePath, targetSeconds) {
     outMontagePath,
   ]);
 }
-  
+async function extractAudioToM4a(videoPath, audioPath) {
+  await runFFmpeg([
+    "-y",
+    "-i",
+    videoPath,
+    "-vn",
+    "-acodec",
+    "aac",
+    "-b:a",
+    "128k",
+    audioPath,
+  ]);
+}
+
+function estimateWordTarget(seconds) {
+  // Approx 150 words per minute ≈ 2.5 words per second
+  return Math.round(seconds * 2.5);
+}  
 
 async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId, targetSeconds) {
   const tmp = "/tmp";
