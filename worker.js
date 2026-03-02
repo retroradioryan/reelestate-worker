@@ -355,12 +355,54 @@ async function processQueued(job) {
   console.log("📦 Processing QUEUED job:", jobId);
 
   const maxSeconds = Number(locked.max_seconds || 20);
+  let avatarId = null;
+let voiceId = null;
+
+// 1️⃣ Resolve avatar from avatars table
+if (locked.avatar_id) {
+  const { data: avatar, error: avatarErr } = await supabase
+    .from("avatars")
+    .select("provider_avatar_id")
+    .eq("id", locked.avatar_id)
+    .single();
+
+  if (avatarErr || !avatar) {
+    throw new Error("Avatar not found for job " + jobId);
+  }
+
+  avatarId = avatar.provider_avatar_id;
+}
+
+// 2️⃣ Resolve voice from voices table
+if (locked.voice_id) {
+  const { data: voice, error: voiceErr } = await supabase
+    .from("voices")
+    .select("provider_voice_id")
+    .eq("id", locked.voice_id)
+    .single();
+
+  if (voiceErr || !voice) {
+    throw new Error("Voice not found for job " + jobId);
+  }
+
+  voiceId = voice.provider_voice_id;
+}
+
+// 3️⃣ Fallback to legacy env logic if missing
+if (!avatarId || !voiceId) {
+  console.log("⚠️ Falling back to legacy avatar_type logic");
+
   const avatarType = String(locked.avatar_type || "female").toLowerCase();
   const isMale = avatarType === "male";
 
-  const avatarId = isMale ? HEYGEN_AVATAR_ID_MALE : HEYGEN_AVATAR_ID_FEMALE;
-  const voiceId = isMale ? HEYGEN_VOICE_ID_MALE : HEYGEN_VOICE_ID_FEMALE;
+  avatarId = isMale
+    ? HEYGEN_AVATAR_ID_MALE
+    : HEYGEN_AVATAR_ID_FEMALE;
 
+  voiceId = isMale
+    ? HEYGEN_VOICE_ID_MALE
+    : HEYGEN_VOICE_ID_FEMALE;
+}
   // Transcribe walkthrough -> write script
   const { transcript, script } = await generateAvatarScriptFromWalkthrough(
     locked.walkthrough_url,
