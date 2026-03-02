@@ -32,23 +32,20 @@ app.get("/", (req, res) => {
 });
 
 /* ==============================
-   CREATE JOB (Website → API)
+   CREATE JOB
 ============================== */
 app.post("/compose-walkthrough", async (req, res) => {
   try {
     const { walkthroughUrl, maxSeconds = 20, avatarType, email } = req.body;
 
-    if (!walkthroughUrl) {
+    if (!walkthroughUrl)
       return res.status(400).json({ ok: false, error: "walkthroughUrl required" });
-    }
 
-    if (!email) {
+    if (!email)
       return res.status(400).json({ ok: false, error: "email required" });
-    }
 
-    if (!avatarType || !["male", "female"].includes(String(avatarType).toLowerCase())) {
+    if (!avatarType || !["male", "female"].includes(String(avatarType).toLowerCase()))
       return res.status(400).json({ ok: false, error: "avatarType must be 'male' or 'female'" });
-    }
 
     const { data: job, error } = await supabase
       .from("render_jobs")
@@ -85,9 +82,8 @@ app.get("/job/:id", async (req, res) => {
       .eq("id", req.params.id)
       .single();
 
-    if (error || !data) {
+    if (error || !data)
       return res.status(404).json({ ok: false, error: "Job not found" });
-    }
 
     res.json({ ok: true, job: data });
 
@@ -98,39 +94,43 @@ app.get("/job/:id", async (req, res) => {
 });
 
 /* ==============================
-   HEYGEN WEBHOOK (FINAL URL DIRECT)
+   HEYGEN WEBHOOK (PROPER v2 HANDLING)
 ============================== */
 app.post("/heygen-callback", async (req, res) => {
-  // Respond immediately (prevents retries)
+  // Always respond immediately (prevents retries)
   res.json({ ok: true });
 
   try {
     const token = req.query?.token ? String(req.query.token) : null;
     const jobId = req.query?.job_id ? String(req.query.job_id) : null;
 
-    console.log("📩 Webhook hit for job:", jobId);
-
-    if (HEYGEN_WEBHOOK_SECRET) {
-      if (!token || token !== HEYGEN_WEBHOOK_SECRET) {
-        console.log("❌ Invalid webhook token");
-        return;
-      }
-    }
-
-    if (!jobId) {
-      console.log("❌ Missing job_id in query");
+    if (HEYGEN_WEBHOOK_SECRET && token !== HEYGEN_WEBHOOK_SECRET) {
+      console.log("❌ Invalid webhook token");
       return;
     }
 
-    // HeyGen v2 sends video URL directly
+    if (!jobId) {
+      console.log("❌ Missing job_id");
+      return;
+    }
+
+    console.log("📩 Webhook body:", JSON.stringify(req.body));
+
+    const eventType = req.body?.event_type || req.body?.type || null;
+
+    // Ignore anything except completed
+    if (eventType !== "video.completed") {
+      console.log("ℹ️ Ignoring event:", eventType);
+      return;
+    }
+
     const videoUrl =
       req.body?.data?.video_url ||
       req.body?.data?.url ||
-      req.body?.video_url ||
       null;
 
     if (!videoUrl) {
-      console.log("⚠️ Webhook fired but video_url not present yet");
+      console.log("❌ Completed event but no video_url found");
       return;
     }
 
