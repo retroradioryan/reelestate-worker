@@ -311,41 +311,7 @@ async function simpleTrimFallback(inWalkPath, outMontagePath, targetSeconds) {
     outMontagePath,
   ]);
 }
-  const parts = [];
-  for (let i = 0; i < segments.length; i++) {
-    const s = Math.max(0, Number(segments[i].start || 0));
-    const e = Math.max(s, Number(segments[i].end || s));
-    parts.push(
-  `[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS,fps=30[v${i}]`
-);
-  }
-
-  const concatInputs = segments.map((_, i) => `[v${i}]`).join("");
-  const filter = `${parts.join(";")};${concatInputs}concat=n=${segments.length}:v=1:a=0[vout]`;
-
-  await runFFmpeg([
-    "-y",
-    "-i",
-    inWalkPath,
-    "-filter_complex",
-    filter,
-    "-map",
-    "[vout]",
-    "-t",
-    String(targetSeconds),
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-crf",
-    "23",
-    "-pix_fmt",
-    "yuv420p",
-    "-movflags",
-    "+faststart",
-    outMontagePath,
-  ]);
-}
+  
 
 async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId, targetSeconds) {
   const tmp = "/tmp";
