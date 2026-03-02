@@ -62,8 +62,8 @@ const MAX_TRANSCRIBE_SECONDS = Number(process.env.MAX_TRANSCRIBE_SECONDS || 300)
 const MAX_SEGMENTS_TO_SEND = Number(process.env.MAX_SEGMENTS_TO_SEND || 450);
 
 // Output defaults
-const DEFAULT_TARGET_SECONDS = Number(process.env.DEFAULT_TARGET_SECONDS || 120); // 2 minutes default
-const MAX_TARGET_SECONDS = Number(process.env.MAX_TARGET_SECONDS || 180); // clamp user input (optional safety)
+const DEFAULT_TARGET_SECONDS = Number(process.env.DEFAULT_TARGET_SECONDS || 300); // 5 minutes default
+const MAX_TARGET_SECONDS = Number(process.env.MAX_TARGET_SECONDS || 300); // clamp user input (optional safety)
 
 // Keying
 const KEY_COLOR_HEX = process.env.KEY_COLOR_HEX || "#00FF00";
