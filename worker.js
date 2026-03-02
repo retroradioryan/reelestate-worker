@@ -1,46 +1,23 @@
-// worker.js (FINAL PRODUCTION — Whisper → Script → HeyGen → Composite + Logo + Lower Third + Email)
+// worker.js (PRODUCTION — FULL TRANSCRIBE (<=5min) → 2min MONTAGE PLAN → HeyGen → Montage Composite + Logo + Lower Third + Email)
 // Pipeline:
-// queued -> processing -> heygen_requested -> (API webhook sets rendering + heygen_video_url) -> rendering_in_progress -> completed
+// queued -> processing -> heygen_requested -> (webhook sets rendering + heygen_video_url) -> rendering_in_progress -> completed
 //
-// Requires Render ENV vars:
-// SUPABASE_URL
-// SUPABASE_SERVICE_ROLE_KEY
-// OPENAI_API_KEY
-// HEYGEN_API_KEY
-// HEYGEN_CALLBACK_BASE_URL
-// HEYGEN_WEBHOOK_SECRET
-// HEYGEN_AVATAR_ID_MALE
-// HEYGEN_AVATAR_ID_FEMALE
-// HEYGEN_VOICE_ID_MALE
-// HEYGEN_VOICE_ID_FEMALE
-// RESEND_API_KEY
-// FROM_EMAIL
+// ✅ This version does TRUE SYNC via a montage:
+// - Whisper transcribes the FULL walkthrough (<= 5 minutes cap)
+// - GPT outputs a montage plan: multiple time windows totaling ~120s + narration line per window
+// - Worker builds montage by trimming + concatenating those windows
+// - HeyGen voice narrates the montage (audio aligns with chosen windows)
+// - Final output hard-capped to 120 seconds
 //
-// Optional ENV vars:
-// STORAGE_BUCKET=videos
-// POLL_MS=5000
-// KEY_COLOR_HEX=#00FF00
-// KEY_COLOR_FFMPEG=0x00FF00
-// KEY_SIMILARITY=0.32
-// KEY_BLEND=0.18
-// AVATAR_SCALE_W=560
-// AVATAR_MARGIN_X=60
-// AVATAR_MARGIN_Y=10
-// AVATAR_OPACITY=0.92
-// EDGE_SOFTEN=1
-// LT_TEXT="Brand New Listing"
-// LT_BAR_Y=1660
-// LT_BAR_H=240
-// LT_BAR_ALPHA=0.55
-// LOGO_URL=<public png url>
-// LOGO_W=210
-// LOGO_MARGIN_X=40
-// LOGO_MARGIN_Y=40
-// FONT_FILE=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+// NO DB CHANGES:
+// - montage plan stored inside existing render_jobs.script_text as JSON string
+// - transcript_text stored as plain text (if your column exists)
 //
-// Notes:
-// - Audio: final video uses HeyGen audio (avatar voice), not the walkthrough audio.
-// - Walkthrough audio is used ONLY to transcribe + rewrite script.
+// ENV (required): same as your current
+// ENV (new optional):
+// MAX_FINAL_SECONDS=120            (default 120 for 2 mins)
+// MAX_TRANSCRIBE_SECONDS=300       (default 5 mins)
+// MAX_SEGMENTS_TO_SEND=450         (limit Whisper segments passed to GPT)
 
 import { createClient } from "@supabase/supabase-js";
 import { spawn } from "child_process";
@@ -81,6 +58,11 @@ const FROM_EMAIL = mustEnv("FROM_EMAIL");
 const STORAGE_BUCKET = process.env.STORAGE_BUCKET || "videos";
 const POLL_MS = Number(process.env.POLL_MS || 5000);
 
+// Caps
+const MAX_FINAL_SECONDS = Number(process.env.MAX_FINAL_SECONDS || 120); // ✅ 2 minutes
+const MAX_TRANSCRIBE_SECONDS = Number(process.env.MAX_TRANSCRIBE_SECONDS || 300); // ✅ 5 minutes cap
+const MAX_SEGMENTS_TO_SEND = Number(process.env.MAX_SEGMENTS_TO_SEND || 450);
+
 // Keying
 const KEY_COLOR_HEX = process.env.KEY_COLOR_HEX || "#00FF00";
 const KEY_COLOR_FFMPEG = (process.env.KEY_COLOR_FFMPEG || "0x00FF00").trim();
@@ -90,9 +72,9 @@ const KEY_BLEND = String(process.env.KEY_BLEND || "0.18");
 // Layout tuning
 const AVATAR_SCALE_W = Number(process.env.AVATAR_SCALE_W || 560);
 const AVATAR_MARGIN_X = Number(process.env.AVATAR_MARGIN_X || 60);
-const AVATAR_MARGIN_Y = Number(process.env.AVATAR_MARGIN_Y || 10); // very low, “sits” on ground
-const AVATAR_OPACITY = Number(process.env.AVATAR_OPACITY || 0.92); // reduce “opaque cut-out”
-const EDGE_SOFTEN = String(process.env.EDGE_SOFTEN || "1"); // boxblur strength (0 disables)
+const AVATAR_MARGIN_Y = Number(process.env.AVATAR_MARGIN_Y || 10);
+const AVATAR_OPACITY = Number(process.env.AVATAR_OPACITY || 0.92);
+const EDGE_SOFTEN = String(process.env.EDGE_SOFTEN || "1");
 
 const LT_TEXT = process.env.LT_TEXT || "Brand New Listing";
 const LT_BAR_Y = Number(process.env.LT_BAR_Y || 1660);
@@ -120,11 +102,16 @@ const resend = new Resend(RESEND_API_KEY);
 
 console.log("🚀 WORKER LIVE");
 console.log("Polling every", POLL_MS, "ms");
+console.log("Caps:", { MAX_FINAL_SECONDS, MAX_TRANSCRIBE_SECONDS });
 
 /* ==============================
    UTILS
 ============================== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
 
 function safeUnlink(p) {
   try {
@@ -139,6 +126,36 @@ function runFFmpeg(args) {
     ff.on("error", reject);
     ff.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`FFmpeg failed (${code})`))));
   });
+}
+
+function runFFprobe(args) {
+  return new Promise((resolve, reject) => {
+    const fp = spawn("ffprobe", args);
+    let out = "";
+    let err = "";
+    fp.stdout.on("data", (d) => (out += d.toString()));
+    fp.stderr.on("data", (d) => (err += d.toString()));
+    fp.on("error", reject);
+    fp.on("close", (code) => {
+      if (code === 0) return resolve({ out, err });
+      reject(new Error(`ffprobe failed (${code}): ${err || out}`));
+    });
+  });
+}
+
+async function getVideoDurationSeconds(localVideoPath) {
+  const { out } = await runFFprobe([
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    localVideoPath,
+  ]);
+  const dur = Number(String(out || "").trim());
+  if (!Number.isFinite(dur) || dur <= 0) return null;
+  return dur;
 }
 
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 120000) {
@@ -188,7 +205,7 @@ async function sendFinalEmail(to, url, jobId) {
 }
 
 /* ==============================
-   AUDIO → WHISPER → SCRIPT
+   AUDIO → WHISPER → MONTAGE PLAN (segments + lines) → stitched script
 ============================== */
 async function extractAudioToM4a(videoPath, audioOutPath) {
   await runFFmpeg([
@@ -209,57 +226,218 @@ async function extractAudioToM4a(videoPath, audioOutPath) {
 }
 
 function estimateWordTarget(seconds) {
-  // ~2.4 words/sec pace
-  return Math.max(35, Math.round(seconds * 2.4));
+  // ~2.4 words/sec
+  return Math.max(80, Math.round(seconds * 2.4));
 }
 
-async function generateAvatarScriptFromWalkthrough(walkthroughUrl, jobId, maxSeconds = 20) {
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+// Build a montage mp4 from the original walkthrough and an array of segments
+// segments: [{start, end}]
+async function buildMontageVideo(inWalkPath, outMontagePath, segments) {
+  if (!segments?.length) {
+    // fallback: first MAX_FINAL_SECONDS
+    await runFFmpeg([
+      "-y",
+      "-i",
+      inWalkPath,
+      "-t",
+      String(MAX_FINAL_SECONDS),
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "23",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      outMontagePath,
+    ]);
+    return;
+  }
+
+  // Create filter_complex that trims each segment and concatenates
+  const parts = [];
+  for (let i = 0; i < segments.length; i++) {
+    const s = Math.max(0, Number(segments[i].start || 0));
+    const e = Math.max(s, Number(segments[i].end || s));
+    parts.push(
+      `[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS[v${i}]`
+    );
+  }
+
+  const concatInputs = segments.map((_, i) => `[v${i}]`).join("");
+  const filter = `${parts.join(";")};${concatInputs}concat=n=${segments.length}:v=1:a=0[vout]`;
+
+  await runFFmpeg([
+    "-y",
+    "-i",
+    inWalkPath,
+    "-filter_complex",
+    filter,
+    "-map",
+    "[vout]",
+    "-t",
+    String(MAX_FINAL_SECONDS),
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    outMontagePath,
+  ]);
+}
+
+async function generateMontagePlanFromWalkthrough(walkthroughUrl, jobId) {
   const tmp = "/tmp";
   const videoPath = path.join(tmp, `walk-${jobId}.mp4`);
   const audioPath = path.join(tmp, `audio-${jobId}.m4a`);
 
   try {
     await downloadFile(walkthroughUrl, videoPath);
+
+    // ✅ enforce Whisper max duration (5 mins)
+    const duration = await getVideoDurationSeconds(videoPath);
+    if (duration && duration > MAX_TRANSCRIBE_SECONDS) {
+      throw new Error(
+        `Walkthrough is ${Math.round(duration)}s (~${Math.ceil(duration / 60)}min). ` +
+          `Max allowed is ${MAX_TRANSCRIBE_SECONDS}s (${Math.ceil(MAX_TRANSCRIBE_SECONDS / 60)}min).`
+      );
+    }
+
     await extractAudioToM4a(videoPath, audioPath);
 
-    console.log("🧠 Transcribing walkthrough audio (Whisper)…");
-
+    console.log("🧠 Whisper transcribing full audio (verbose_json) …");
     const transcriptRes = await openai.audio.transcriptions.create({
       model: "whisper-1",
       file: fs.createReadStream(audioPath),
+      response_format: "verbose_json",
     });
 
-    const transcript = (transcriptRes?.text || "").trim();
+    const transcript = String(transcriptRes?.text || "").trim();
+    const segments = Array.isArray(transcriptRes?.segments) ? transcriptRes.segments : [];
+
     if (!transcript) throw new Error("Empty transcript from Whisper");
 
-    console.log("✍️ Writing avatar script from transcript…");
+    // Token-safe payload
+    const timed = segments.slice(0, MAX_SEGMENTS_TO_SEND).map((s) => ({
+      start: Number(s.start || 0),
+      end: Number(s.end || 0),
+      text: String(s.text || "").trim(),
+    }));
 
-    const wordTarget = estimateWordTarget(maxSeconds);
+    const targetSeconds = MAX_FINAL_SECONDS;
+    const wordTarget = estimateWordTarget(targetSeconds);
 
-    const scriptRes = await openai.chat.completions.create({
+    console.log("✍️ GPT building montage plan (windows + narration per window) …");
+
+    const planRes = await openai.chat.completions.create({
       model: process.env.OPENAI_SCRIPT_MODEL || "gpt-4o-mini",
-      temperature: 0.6,
+      temperature: 0.4,
       messages: [
         {
           role: "system",
           content:
-            "You are a professional real estate agent speaking on camera. " +
-            "Rewrite the transcript into a confident natural spoken script for an avatar narrator. " +
-            "No bullet points. No headings. No emojis. No stage directions. " +
-            "Do NOT mention 'walkthrough', 'recording', or 'this video'. " +
-            "Keep it concise and persuasive. End with a simple call-to-action to book a viewing.",
+            "You are a senior video editor for real-estate walk-throughs. " +
+            "Your job: create a tightly synced montage and narration.\n\n" +
+            "Return ONLY valid JSON with shape:\n" +
+            "{\n" +
+            '  "segments": [ { "start": number, "end": number, "line": string } ],\n' +
+            '  "script": string\n' +
+            "}\n\n" +
+            "Rules:\n" +
+            `- Total montage duration (sum of end-start) should be ~${targetSeconds} seconds (±3s).\n` +
+            "- Segments must be chronological (increasing time), and each segment must be 6–25 seconds.\n" +
+            "- The 'line' must describe what is being shown during THAT segment (kitchen, bedroom, garden, etc.).\n" +
+            "- The combined 'script' should be the lines joined into one natural narration.\n" +
+            "- Script style: confident agent voice, no bullets/headings/emojis/stage directions. " +
+            "Do NOT say 'walkthrough', 'recording', or 'this video'. End with a viewing call-to-action.\n" +
+            `- Keep narration length around ${wordTarget} words total.\n`,
         },
         {
           role: "user",
-          content: `MAX SECONDS: ${maxSeconds}\nWORD TARGET: ~${wordTarget}\n\nTRANSCRIPT:\n${transcript}`,
+          content:
+            `TARGET_SECONDS: ${targetSeconds}\n\n` +
+            `FULL_TRANSCRIPT:\n${transcript}\n\n` +
+            `TIMED_SEGMENTS:\n${JSON.stringify(timed)}\n`,
         },
       ],
     });
 
-    const script = (scriptRes?.choices?.[0]?.message?.content || "").trim();
-    if (!script) throw new Error("Empty script from OpenAI");
+    const raw = String(planRes?.choices?.[0]?.message?.content || "").trim();
+    const json = safeJsonParse(raw);
 
-    return { transcript, script };
+    if (!json?.segments?.length) {
+      // fallback: first window + summarize
+      console.log("⚠️ Montage plan JSON invalid; falling back to single segment.");
+      return {
+        transcript,
+        plan: {
+          segments: [{ start: 0, end: targetSeconds, line: "" }],
+          script: "",
+        },
+      };
+    }
+
+    // Validate + clamp segments to video duration
+    const maxT = duration || (segments.length ? Number(segments[segments.length - 1].end || 0) : null);
+    let cleaned = [];
+    let sum = 0;
+
+    for (const seg of json.segments) {
+      let s = Number(seg.start || 0);
+      let e = Number(seg.end || 0);
+      if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
+      if (e <= s) continue;
+
+      if (maxT && maxT > 0) {
+        s = clamp(s, 0, maxT);
+        e = clamp(e, 0, maxT);
+        if (e <= s) continue;
+      } else {
+        s = Math.max(0, s);
+        e = Math.max(s, e);
+      }
+
+      const durSeg = e - s;
+      if (durSeg < 4 || durSeg > 35) continue; // keep reasonable
+
+      cleaned.push({ start: s, end: e, line: String(seg.line || "").trim() });
+      sum += durSeg;
+      if (sum >= targetSeconds + 3) break;
+    }
+
+    if (!cleaned.length) {
+      cleaned = [{ start: 0, end: targetSeconds, line: "" }];
+    }
+
+    // Force total cap
+    const script =
+      String(json.script || "").trim() ||
+      cleaned.map((s) => s.line).filter(Boolean).join(" ").trim();
+
+    return {
+      transcript,
+      plan: {
+        segments: cleaned,
+        script,
+      },
+    };
   } finally {
     safeUnlink(videoPath);
     safeUnlink(audioPath);
@@ -268,7 +446,6 @@ async function generateAvatarScriptFromWalkthrough(walkthroughUrl, jobId, maxSec
 
 /* ==============================
    HEYGEN: CREATE VIDEO
-   callback_url MUST be root-level
 ============================== */
 async function createHeygenVideo({ scriptText, jobId, avatarId, voiceId }) {
   const callbackUrl =
@@ -336,6 +513,7 @@ async function failJob(jobId, err) {
 
 /* ==============================
    PHASE 1 — queued -> heygen_requested
+   Store montage plan INSIDE script_text as JSON string (no DB changes)
 ============================== */
 async function processQueued(job) {
   const jobId = job.id;
@@ -354,63 +532,58 @@ async function processQueued(job) {
 
   console.log("📦 Processing QUEUED job:", jobId);
 
-  const maxSeconds = Number(locked.max_seconds || 20);
   let avatarId = null;
-let voiceId = null;
+  let voiceId = null;
 
-// 1️⃣ Resolve avatar from avatars table
-if (locked.avatar_id) {
-  const { data: avatar, error: avatarErr } = await supabase
-    .from("avatars")
-    .select("provider_avatar_id")
-    .eq("id", locked.avatar_id)
-    .single();
+  // 1️⃣ Resolve avatar from avatars table
+  if (locked.avatar_id) {
+    const { data: avatar, error: avatarErr } = await supabase
+      .from("avatars")
+      .select("provider_avatar_id")
+      .eq("id", locked.avatar_id)
+      .single();
 
-  if (avatarErr || !avatar) {
-    throw new Error("Avatar not found for job " + jobId);
+    if (avatarErr || !avatar) throw new Error("Avatar not found for job " + jobId);
+    avatarId = avatar.provider_avatar_id;
   }
 
-  avatarId = avatar.provider_avatar_id;
-}
+  // 2️⃣ Resolve voice from voices table
+  if (locked.voice_id) {
+    const { data: voice, error: voiceErr } = await supabase
+      .from("voices")
+      .select("provider_voice_id")
+      .eq("id", locked.voice_id)
+      .single();
 
-// 2️⃣ Resolve voice from voices table
-if (locked.voice_id) {
-  const { data: voice, error: voiceErr } = await supabase
-    .from("voices")
-    .select("provider_voice_id")
-    .eq("id", locked.voice_id)
-    .single();
-
-  if (voiceErr || !voice) {
-    throw new Error("Voice not found for job " + jobId);
+    if (voiceErr || !voice) throw new Error("Voice not found for job " + jobId);
+    voiceId = voice.provider_voice_id;
   }
 
-  voiceId = voice.provider_voice_id;
-}
+  // 3️⃣ Fallback env logic
+  if (!avatarId || !voiceId) {
+    console.log("⚠️ Falling back to legacy avatar_type logic");
+    const avatarType = String(locked.avatar_type || "female").toLowerCase();
+    const isMale = avatarType === "male";
+    avatarId = isMale ? HEYGEN_AVATAR_ID_MALE : HEYGEN_AVATAR_ID_FEMALE;
+    voiceId = isMale ? HEYGEN_VOICE_ID_MALE : HEYGEN_VOICE_ID_FEMALE;
+  }
 
-// 3️⃣ Fallback to legacy env logic if missing
-if (!avatarId || !voiceId) {
-  console.log("⚠️ Falling back to legacy avatar_type logic");
-
-  const avatarType = String(locked.avatar_type || "female").toLowerCase();
-  const isMale = avatarType === "male";
-
-  avatarId = isMale
-    ? HEYGEN_AVATAR_ID_MALE
-    : HEYGEN_AVATAR_ID_FEMALE;
-
-  voiceId = isMale
-    ? HEYGEN_VOICE_ID_MALE
-    : HEYGEN_VOICE_ID_FEMALE;
-}
-  // Transcribe walkthrough -> write script
-  const { transcript, script } = await generateAvatarScriptFromWalkthrough(
+  // FULL transcribe -> montage plan (segments + synced narration)
+  const { transcript, plan } = await generateMontagePlanFromWalkthrough(
     locked.walkthrough_url,
-    jobId,
-    maxSeconds
+    jobId
   );
 
-  // Ask HeyGen to generate avatar video (green-screen)
+  // Script must exist; if GPT returned empty, derive from lines
+  const script =
+    String(plan.script || "").trim() ||
+    plan.segments.map((s) => s.line).filter(Boolean).join(" ").trim();
+
+  if (!script) {
+    throw new Error("Montage narration script is empty (GPT output).");
+  }
+
+  // Generate HeyGen avatar video
   const heygenVideoId = await createHeygenVideo({
     scriptText: script,
     jobId,
@@ -418,15 +591,19 @@ if (!avatarId || !voiceId) {
     voiceId,
   });
 
-  // Save
-  // NOTE: transcript_text / script_text columns must exist, otherwise remove these two fields.
+  // Store montage plan as JSON in script_text (NO DB CHANGES)
+  const packed = JSON.stringify({
+    script,
+    segments: plan.segments, // [{start,end,line}]
+  });
+
   const { error: updErr } = await supabase
     .from("render_jobs")
     .update({
       status: "heygen_requested",
       heygen_video_id: heygenVideoId,
-      transcript_text: transcript,
-      script_text: script,
+      transcript_text: transcript, // if your column exists
+      script_text: packed,         // JSON string containing montage plan
     })
     .eq("id", jobId);
 
@@ -438,11 +615,10 @@ if (!avatarId || !voiceId) {
 /* ==============================
    PHASE 2 — rendering -> completed
    Composite:
-   - Background: walkthrough (scaled/padded to 1080x1920)
-   - Avatar: colorkey + soften + opacity, bottom-right “sitting”
-   - Lower third: bar + text
-   - Logo: static png, top-right
-   - Audio: HeyGen audio (1:a?)
+   - Background: montage built from stored segments (script_text JSON)
+   - Avatar: colorkey + soften + opacity
+   - Lower third + Logo
+   - Audio: HeyGen audio
 ============================== */
 function escapeDrawtext(s) {
   return String(s || "")
@@ -472,10 +648,11 @@ async function processRendering(job) {
     return;
   }
 
-  console.log("🎬 Compositing FINAL video:", jobId);
+  console.log("🎬 Compositing FINAL montage video:", jobId);
 
   const tmp = "/tmp";
   const walkPath = path.join(tmp, `walk-${jobId}.mp4`);
+  const montagePath = path.join(tmp, `montage-${jobId}.mp4`);
   const avatarPath = path.join(tmp, `avatar-${jobId}.mp4`);
   const logoPath = path.join(tmp, `logo-${jobId}.png`);
   const finalPath = path.join(tmp, `final-${jobId}.mp4`);
@@ -485,46 +662,42 @@ async function processRendering(job) {
     await downloadFile(locked.heygen_video_url, avatarPath);
     await downloadFile(LOGO_URL, logoPath);
 
-    const headline = (locked.property_headline || LT_TEXT || "Brand New Listing").trim();
-const safeLT = escapeDrawtext(headline);
+    // Parse montage plan from script_text JSON
+    let montagePlan = null;
+    if (locked.script_text) {
+      montagePlan = safeJsonParse(String(locked.script_text));
+    }
 
-    // Slight edge soften optional
+    const segments = Array.isArray(montagePlan?.segments) ? montagePlan.segments : null;
+
+    // Build montage background video
+    await buildMontageVideo(walkPath, montagePath, segments);
+
+    const headline = (locked.property_headline || LT_TEXT || "Brand New Listing").trim();
+    const safeLT = escapeDrawtext(headline);
+
     const soften =
       EDGE_SOFTEN && Number(EDGE_SOFTEN) > 0
         ? `,boxblur=${EDGE_SOFTEN}:${EDGE_SOFTEN}`
         : "";
 
-    // Filter graph
-    // Inputs:
-    // 0 = walkthrough mp4
-    // 1 = avatar mp4 (green screen)
-    // 2 = logo png
     const filter =
-      // background normalize to 1080x1920
       `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
       `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[vbg0];` +
-
-      // lower third bar + text
       `[vbg0]drawbox=x=0:y=${LT_BAR_Y}:w=1080:h=${LT_BAR_H}:color=black@${LT_BAR_ALPHA}:t=fill,` +
       `drawtext=fontfile='${FONT_FILE}':text='${safeLT}':fontcolor=white:fontsize=64:` +
       `x=(w-text_w)/2:y=${LT_BAR_Y + 60}[vbg];` +
-
-      // key avatar + scale + soften + opacity
       `[1:v]scale=${AVATAR_SCALE_W}:-2,format=rgba,` +
       `colorkey=${KEY_COLOR_FFMPEG}:${KEY_SIMILARITY}:${KEY_BLEND}${soften},` +
       `colorchannelmixer=aa=${AVATAR_OPACITY}[av];` +
-
-      // overlay avatar bottom-right
       `[vbg][av]overlay=x=W-w-${AVATAR_MARGIN_X}:y=${LT_BAR_Y}-h-30[v1];` +
-
-      // logo top-right (keep it crisp)
       `[2:v]scale=${LOGO_W}:-1,format=rgba[lg];` +
       `[v1][lg]overlay=x=W-w-${LOGO_MARGIN_X}:y=${LOGO_MARGIN_Y}[outv]`;
 
     await runFFmpeg([
       "-y",
       "-i",
-      walkPath,
+      montagePath, // ✅ montage background
       "-i",
       avatarPath,
       "-i",
@@ -534,8 +707,10 @@ const safeLT = escapeDrawtext(headline);
       "-map",
       "[outv]",
       "-map",
-      "1:a?", // HeyGen audio (avatar)
+      "1:a?",
       "-shortest",
+      "-t",
+      String(MAX_FINAL_SECONDS), // ✅ hard cap final duration
       "-c:v",
       "libx264",
       "-preset",
@@ -574,6 +749,7 @@ const safeLT = escapeDrawtext(headline);
     }
   } finally {
     safeUnlink(walkPath);
+    safeUnlink(montagePath);
     safeUnlink(avatarPath);
     safeUnlink(logoPath);
     safeUnlink(finalPath);
