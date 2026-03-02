@@ -683,6 +683,11 @@ async function processRendering(job) {
     await downloadFile(locked.walkthrough_url, walkPath);
     await downloadFile(locked.heygen_video_url, avatarPath);
 
+     const avatarDuration = await getVideoDurationSeconds(avatarPath);
+if (!avatarDuration) throw new Error("Could not determine avatar duration");
+
+console.log("🎙 Avatar duration:", avatarDuration);
+
     const logoUrl = (locked.logo_url || DEFAULT_LOGO_URL).trim();
     await downloadFile(logoUrl, logoPath);
 
@@ -697,7 +702,12 @@ async function processRendering(job) {
     const segments = Array.isArray(packed?.segments) ? packed.segments : [];
 
     // Build montage background
-    await buildMontageVideo(walkPath, montagePath, segments, targetSeconds);
+    await buildMontageVideo(
+  walkPath,
+  montagePath,
+  segments,
+  Math.floor(avatarDuration)
+);
 
     const headline = (locked.property_headline || LT_TEXT || "Brand New Listing").trim();
     const safeLT = escapeDrawtext(headline);
@@ -738,9 +748,6 @@ async function processRendering(job) {
       "[outv]",
       "-map",
       "1:a?", // HeyGen audio
-      
-      "-t",
-      String(targetSeconds),
       "-c:v",
       "libx264",
       "-preset",
