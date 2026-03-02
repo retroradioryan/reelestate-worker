@@ -94,10 +94,10 @@ app.get("/job/:id", async (req, res) => {
 });
 
 /* ==============================
-   HEYGEN WEBHOOK (PROPER v2 HANDLING)
+   HEYGEN WEBHOOK (CORRECT FOR YOUR PAYLOAD)
 ============================== */
 app.post("/heygen-callback", async (req, res) => {
-  // Always respond immediately (prevents retries)
+  // Respond immediately (prevents retries)
   res.json({ ok: true });
 
   try {
@@ -114,23 +114,22 @@ app.post("/heygen-callback", async (req, res) => {
       return;
     }
 
-    console.log("📩 Webhook body:", JSON.stringify(req.body));
+    const eventType = req.body?.event_type || null;
 
-    const eventType = req.body?.event_type || req.body?.type || null;
-
-    // Ignore anything except completed
-    if (eventType !== "video.completed") {
-      console.log("ℹ️ Ignoring event:", eventType);
+    // Ignore GIF preview event
+    if (eventType === "avatar_video_gif.success") {
       return;
     }
 
-    const videoUrl =
-      req.body?.data?.video_url ||
-      req.body?.data?.url ||
-      null;
+    // Only proceed when final MP4 is ready
+    if (eventType !== "avatar_video.success") {
+      return;
+    }
+
+    const videoUrl = req.body?.event_data?.url || null;
 
     if (!videoUrl) {
-      console.log("❌ Completed event but no video_url found");
+      console.log("❌ avatar_video.success but no URL found");
       return;
     }
 
