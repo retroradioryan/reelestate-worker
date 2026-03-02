@@ -227,62 +227,97 @@ async function sendFinalEmail(to, url, jobId) {
 /* ==============================
    AUDIO → WHISPER → MONTAGE PLAN
 ============================== */
-async function extractAudioToM4a(videoPath, audioOutPath) {
-  await runFFmpeg([
-    "-y",
-    "-i",
-    videoPath,
-    "-vn",
-    "-ac",
-    "1",
-    "-ar",
-    "44100",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    audioOutPath,
-  ]);
-}
-
-function estimateWordTarget(seconds) {
-  // ~2.4 words/sec
-  return Math.max(60, Math.round(seconds * 2.4));
-}
-
-/**
- * Build montage video: trims each segment and concatenates (video only).
- * segments: [{start:number,end:number}]
- */
 async function buildMontageVideo(inWalkPath, outMontagePath, segments, targetSeconds) {
+  const MIN_SEGMENT_TOTAL_RATIO = 0.8; // must cover at least 80% of target
+  const SAFE_MIN_SECONDS = 10;
+
+  // If no valid segments → simple trim fallback
   if (!Array.isArray(segments) || segments.length === 0) {
-    // fallback: first targetSeconds
-    await runFFmpeg([
-      "-y",
-      "-i",
-      inWalkPath,
-      "-t",
-      String(targetSeconds),
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-crf",
-      "23",
-      "-pix_fmt",
-      "yuv420p",
-      "-movflags",
-      "+faststart",
-      outMontagePath,
-    ]);
-    return;
+    console.log("⚠️ No montage segments returned. Using simple trim fallback.");
+    return simpleTrimFallback(inWalkPath, outMontagePath, targetSeconds);
   }
 
+  // Calculate real total duration from segments
+  const totalDuration = segments.reduce((sum, seg) => {
+    const s = Math.max(0, Number(seg.start || 0));
+    const e = Math.max(s, Number(seg.end || s));
+    return sum + (e - s);
+  }, 0);
+
+  console.log("📊 Montage total segment duration:", totalDuration, "seconds");
+
+  // If GPT returned too little usable footage → fallback
+  if (
+    totalDuration < SAFE_MIN_SECONDS ||
+    totalDuration < targetSeconds * MIN_SEGMENT_TOTAL_RATIO
+  ) {
+    console.log("⚠️ Segment duration too short. Using simple trim fallback.");
+    return simpleTrimFallback(inWalkPath, outMontagePath, targetSeconds);
+  }
+
+  // Build trim filters
   const parts = [];
   for (let i = 0; i < segments.length; i++) {
     const s = Math.max(0, Number(segments[i].start || 0));
     const e = Math.max(s, Number(segments[i].end || s));
     parts.push(`[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS[v${i}]`);
+  }
+
+  const concatInputs = segments.map((_, i) => `[v${i}]`).join("");
+  const filter =
+    `${parts.join(";")};` +
+    `${concatInputs}concat=n=${segments.length}:v=1:a=0[vout]`;
+
+  await runFFmpeg([
+    "-y",
+    "-i",
+    inWalkPath,
+    "-filter_complex",
+    filter,
+    "-map",
+    "[vout]",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    outMontagePath,
+  ]);
+}
+async function simpleTrimFallback(inWalkPath, outMontagePath, targetSeconds) {
+  await runFFmpeg([
+    "-y",
+    "-i",
+    inWalkPath,
+    "-t",
+    String(targetSeconds),
+    "-vf",
+    "setpts=PTS-STARTPTS,fps=30",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    outMontagePath,
+  ]);
+}
+  const parts = [];
+  for (let i = 0; i < segments.length; i++) {
+    const s = Math.max(0, Number(segments[i].start || 0));
+    const e = Math.max(s, Number(segments[i].end || s));
+    parts.push(
+  `[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS,fps=30[v${i}]`
+);
   }
 
   const concatInputs = segments.map((_, i) => `[v${i}]`).join("");
