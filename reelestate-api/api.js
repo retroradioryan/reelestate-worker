@@ -15,7 +15,6 @@ function mustEnv(name) {
 
 const SUPABASE_URL = mustEnv("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
-const HEYGEN_API_KEY = mustEnv("HEYGEN_API_KEY");
 const HEYGEN_WEBHOOK_SECRET = process.env.HEYGEN_WEBHOOK_SECRET || null;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -33,7 +32,7 @@ app.get("/", (req, res) => {
 });
 
 /* ==============================
-   CREATE JOB
+   CREATE JOB (Website → API)
 ============================== */
 app.post("/compose-walkthrough", async (req, res) => {
   try {
@@ -68,6 +67,7 @@ app.post("/compose-walkthrough", async (req, res) => {
     console.log("✅ Job created:", job.id);
 
     res.json({ ok: true, job_id: job.id });
+
   } catch (err) {
     console.error("❌ CREATE JOB ERROR:", err);
     res.status(500).json({ ok: false, error: String(err?.message || err) });
@@ -75,7 +75,7 @@ app.post("/compose-walkthrough", async (req, res) => {
 });
 
 /* ==============================
-   JOB STATUS
+   JOB STATUS (Optional)
 ============================== */
 app.get("/job/:id", async (req, res) => {
   try {
@@ -90,6 +90,7 @@ app.get("/job/:id", async (req, res) => {
     }
 
     res.json({ ok: true, job: data });
+
   } catch (err) {
     console.error("❌ JOB STATUS ERROR:", err);
     res.status(500).json({ ok: false });
@@ -97,58 +98,10 @@ app.get("/job/:id", async (req, res) => {
 });
 
 /* ==============================
-   HEYGEN STATUS POLL
-============================== */
-async function fetchHeyGenVideoUrl(videoId) {
-  const maxAttempts = 15;
-  const delayMs = 2500;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    console.log(`🎬 Checking HeyGen status for ${videoId} (attempt ${attempt})`);
-
-    try {
-      const resp = await fetch("https://api.heygen.com/v1/video.status", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Api-Key": HEYGEN_API_KEY,
-        },
-        body: JSON.stringify({ video_id: videoId }),
-      });
-
-      const json = await resp.json().catch(() => null);
-
-      if (!resp.ok) {
-        await new Promise((r) => setTimeout(r, delayMs));
-        continue;
-      }
-
-      const status = json?.data?.status;
-      const url =
-        json?.data?.video_url ||
-        json?.data?.url ||
-        json?.data?.videos?.[0]?.video_url ||
-        json?.data?.videos?.[0]?.url ||
-        null;
-
-      if (status === "completed" && url && String(url).startsWith("http")) {
-        return url;
-      }
-    } catch (err) {
-      console.error("HeyGen fetch error:", err?.message || err);
-    }
-
-    await new Promise((r) => setTimeout(r, delayMs));
-  }
-
-  return null;
-}
-
-/* ==============================
-   HEYGEN WEBHOOK
+   HEYGEN WEBHOOK (FINAL URL DIRECT)
 ============================== */
 app.post("/heygen-callback", async (req, res) => {
-  // Always respond immediately (stops retries)
+  // Respond immediately (prevents retries)
   res.json({ ok: true });
 
   try {
@@ -169,31 +122,15 @@ app.post("/heygen-callback", async (req, res) => {
       return;
     }
 
-    const { data: job, error } = await supabase
-      .from("render_jobs")
-      .select("*")
-      .eq("id", jobId)
-      .single();
-
-    if (error || !job) {
-      console.log("❌ Job not found:", jobId);
-      return;
-    }
-
-    if (!job.heygen_video_id) {
-      console.log("❌ No heygen_video_id on job yet:", jobId);
-      return;
-    }
-
-    if (job.heygen_video_url) {
-      console.log("✅ URL already set:", jobId);
-      return;
-    }
-
-    const videoUrl = await fetchHeyGenVideoUrl(job.heygen_video_id);
+    // HeyGen v2 sends video URL directly
+    const videoUrl =
+      req.body?.data?.video_url ||
+      req.body?.data?.url ||
+      req.body?.video_url ||
+      null;
 
     if (!videoUrl) {
-      console.log("⏳ Video URL not ready yet");
+      console.log("⚠️ Webhook fired but video_url not present yet");
       return;
     }
 
