@@ -714,7 +714,7 @@ format=yuv420p[vbg0];
       "[outv]",
       "-map",
       "1:a?", // HeyGen audio
-      "-shortest",
+      
       "-t",
       String(targetSeconds),
       "-c:v",
