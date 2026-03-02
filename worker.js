@@ -18,6 +18,9 @@
 // Pipeline:
 // queued -> processing -> heygen_requested -> (webhook sets rendering + heygen_video_url) -> rendering_in_progress -> completed
 
+console.log("HEYGEN_API_KEY exists?", Boolean(process.env.HEYGEN_API_KEY));
+console.log("HEYGEN_API_KEY length:", process.env.HEYGEN_API_KEY?.length);
+
 import { createClient } from "@supabase/supabase-js";
 import { spawn } from "child_process";
 import OpenAI from "openai";
