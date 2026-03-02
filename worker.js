@@ -686,19 +686,23 @@ async function processRendering(job) {
       EDGE_SOFTEN && Number(EDGE_SOFTEN) > 0 ? `,boxblur=${EDGE_SOFTEN}:${EDGE_SOFTEN}` : "";
 
     const filter =
-      [0:v]setpts=PTS-STARTPTS,fps=30,
-scale=1080:1920:force_original_aspect_ratio=decrease,
-pad=1080:1920:(ow-iw)/2:(oh-ih)/2,
-format=yuv420p[vbg0];
-      `[vbg0]drawbox=x=0:y=${LT_BAR_Y}:w=1080:h=${LT_BAR_H}:color=black@${LT_BAR_ALPHA}:t=fill,` +
-      `drawtext=fontfile='${FONT_FILE}':text='${safeLT}':fontcolor=white:fontsize=64:` +
-      `x=(w-text_w)/2:y=${LT_BAR_Y + 60}[vbg];` +
-      `[1:v]scale=${AVATAR_SCALE_W}:-2,format=rgba,` +
-      `colorkey=${KEY_COLOR_FFMPEG}:${KEY_SIMILARITY}:${KEY_BLEND}${soften},` +
-      `colorchannelmixer=aa=${AVATAR_OPACITY}[av];` +
-      `[vbg][av]overlay=x=W-w-${AVATAR_MARGIN_X}:y=${LT_BAR_Y}-h-30[v1];` +
-      `[2:v]scale=${LOGO_W}:-1,format=rgba[lg];` +
-      `[v1][lg]overlay=x=W-w-${LOGO_MARGIN_X}:y=${LOGO_MARGIN_Y}[outv]`;
+  `[0:v]setpts=PTS-STARTPTS,fps=30,` +
+  `scale=1080:1920:force_original_aspect_ratio=decrease,` +
+  `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,` +
+  `format=yuv420p[vbg0];` +
+
+  `[vbg0]drawbox=x=0:y=${LT_BAR_Y}:w=1080:h=${LT_BAR_H}:color=black@${LT_BAR_ALPHA}:t=fill,` +
+  `drawtext=fontfile='${FONT_FILE}':text='${safeLT}':fontcolor=white:fontsize=64:` +
+  `x=(w-text_w)/2:y=${LT_BAR_Y + 60}[vbg];` +
+
+  `[1:v]scale=${AVATAR_SCALE_W}:-2,format=rgba,` +
+  `colorkey=${KEY_COLOR_FFMPEG}:${KEY_SIMILARITY}:${KEY_BLEND}${soften},` +
+  `colorchannelmixer=aa=${AVATAR_OPACITY}[av];` +
+
+  `[vbg][av]overlay=x=W-w-${AVATAR_MARGIN_X}:y=${LT_BAR_Y}-h-30[v1];` +
+
+  `[2:v]scale=${LOGO_W}:-1,format=rgba[lg];` +
+  `[v1][lg]overlay=x=W-w-${LOGO_MARGIN_X}:y=${LOGO_MARGIN_Y}[outv]`;
 
     await runFFmpeg([
       "-y",
