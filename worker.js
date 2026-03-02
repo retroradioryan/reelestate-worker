@@ -686,8 +686,10 @@ async function processRendering(job) {
       EDGE_SOFTEN && Number(EDGE_SOFTEN) > 0 ? `,boxblur=${EDGE_SOFTEN}:${EDGE_SOFTEN}` : "";
 
     const filter =
-      `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
-      `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[vbg0];` +
+      [0:v]setpts=PTS-STARTPTS,fps=30,
+scale=1080:1920:force_original_aspect_ratio=decrease,
+pad=1080:1920:(ow-iw)/2:(oh-ih)/2,
+format=yuv420p[vbg0];
       `[vbg0]drawbox=x=0:y=${LT_BAR_Y}:w=1080:h=${LT_BAR_H}:color=black@${LT_BAR_ALPHA}:t=fill,` +
       `drawtext=fontfile='${FONT_FILE}':text='${safeLT}':fontcolor=white:fontsize=64:` +
       `x=(w-text_w)/2:y=${LT_BAR_Y + 60}[vbg];` +
